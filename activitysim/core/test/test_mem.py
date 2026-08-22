@@ -123,3 +123,23 @@ def test_set_process_memory_limit_applies_and_restores():
 def test_set_process_memory_limit_noop_without_resource(monkeypatch):
     monkeypatch.setattr(mem, "resource", None)
     assert mem.set_process_memory_limit(1 * GIB) is False
+
+
+def test_worker_memory_cap_formula(tmp_path):
+    # cap = 0.9 * limit / workers, derived from the cgroup limit (reuses get_memory_limit)
+    root = str(tmp_path)
+    _write(root, "memory.max", str(40 * GIB))
+    import unittest.mock as um
+
+    with um.patch.object(mem, "get_memory_limit", lambda **kw: 40 * GIB):
+        assert mem.worker_memory_cap(4) == int(0.9 * 40 * GIB / 4)
+        assert mem.worker_memory_cap(1) == int(0.9 * 40 * GIB)
+        assert mem.worker_memory_cap(0) == int(0.9 * 40 * GIB)  # clamped to >= 1 worker
+    with um.patch.object(mem, "get_memory_limit", lambda **kw: 0):
+        assert mem.worker_memory_cap(4) == 0  # unknown limit -> no cap
+
+
+def test_memory_fail_recovery_defaults_off():
+    from activitysim.core.configuration.top import Settings
+
+    assert Settings().memory_fail_recovery is False

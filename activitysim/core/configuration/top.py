@@ -444,6 +444,20 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     ceiling to the actual machine/container at runtime, so the cache does not need machine-specific keys.
     """
 
+    memory_fail_recovery: bool = False
+    """
+    Convert a worker's fatal out-of-memory into a recoverable error (Linux only).
+
+    When enabled, each multiprocess worker caps its own anonymous memory at
+    ``0.9 * memory_limit / num_processes`` (``RLIMIT_DATA`` soft limit). An allocation that
+    would exceed the cap raises a catchable ``MemoryError`` inside that worker instead of
+    growing the container to its cgroup limit, where the kernel kills every process in the
+    container as a group. Components integrated with ``chunk.run_with_memory_retry`` then
+    retry the failing chunk in halves. Memory-mapped skims are unaffected (file-backed
+    mappings are exempt from the cap). No effect on platforms without ``RLIMIT_DATA``
+    (Windows), whose allocators already fail over-large allocations with ``MemoryError``.
+    """
+
     chunk_peak_backoff_ratio: float = 0.9
     """
     Fraction of the per-worker budget a chunk's incremental memory peak may reach before the

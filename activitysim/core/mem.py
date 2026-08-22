@@ -396,6 +396,30 @@ def get_peak_rss() -> int:
     return int(maxrss) * 1024 if sys.platform.startswith("linux") else int(maxrss)
 
 
+# Fraction of the container memory limit that all workers together may hold as anonymous
+# memory when memory_fail_recovery is enabled: each worker's cap is
+# WORKER_MEMORY_CAP_RATIO * limit / num_processes. The remainder is headroom for the main
+# process; page cache is reclaimable and cannot itself trigger the kernel OOM killer, so
+# with this in place the workers cannot collectively push the cgroup to a group kill —
+# an over-large allocation fails inside the offending worker as a catchable MemoryError
+# first. This is an insurance ceiling, deliberately independent of the per-component chunk
+# budget: if the budget calculation is ever wrong, the ceiling still holds.
+WORKER_MEMORY_CAP_RATIO = 0.9
+
+
+def worker_memory_cap(num_processes: int) -> int:
+    """The per-worker anonymous-memory cap for memory_fail_recovery, in bytes.
+
+    cap = WORKER_MEMORY_CAP_RATIO * memory_limit / num_processes. Memory-mapped skims are
+    exempt from the cap by nature (RLIMIT_DATA does not count file-backed mappings), so
+    they need no allowance here.
+    """
+    limit = get_memory_limit()
+    if not limit:
+        return 0
+    return int(WORKER_MEMORY_CAP_RATIO * limit / max(int(num_processes), 1))
+
+
 def set_process_memory_limit(nbytes: int) -> bool:
     """Cap this process's anonymous memory at ``nbytes`` (Linux only).
 
