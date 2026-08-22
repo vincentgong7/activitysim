@@ -102,3 +102,24 @@ def test_get_peak_rss_without_resource_module(monkeypatch):
 
     monkeypatch.setattr(mem.psutil, "Process", _Boom)
     assert mem.get_peak_rss() == p2
+
+
+def test_set_process_memory_limit_applies_and_restores():
+    # Linux: the limit is actually applied (read back via getrusage limits); then restored.
+    import resource as _resource
+
+    if not hasattr(_resource, "RLIMIT_DATA"):
+        return  # non-Linux: covered by the no-op branch below
+    old_soft, old_hard = _resource.getrlimit(_resource.RLIMIT_DATA)
+    try:
+        assert mem.set_process_memory_limit(4 * GIB) is True
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_DATA)
+        assert soft == 4 * GIB
+        assert hard == old_hard  # hard limit untouched — that door only closes
+    finally:
+        _resource.setrlimit(_resource.RLIMIT_DATA, (old_soft, old_hard))
+
+
+def test_set_process_memory_limit_noop_without_resource(monkeypatch):
+    monkeypatch.setattr(mem, "resource", None)
+    assert mem.set_process_memory_limit(1 * GIB) is False

@@ -396,6 +396,37 @@ def get_peak_rss() -> int:
     return int(maxrss) * 1024 if sys.platform.startswith("linux") else int(maxrss)
 
 
+def set_process_memory_limit(nbytes: int) -> bool:
+    """Cap this process's anonymous memory at ``nbytes`` (Linux only).
+
+    Sets ``RLIMIT_DATA``, which covers the heap and anonymous mappings but NOT file-backed
+    mappings (memory-mapped skims stay usable regardless of the cap). An allocation that
+    would exceed the cap then raises a catchable ``MemoryError`` in this process instead of
+    growing the cgroup toward its limit, where the kernel would kill every process in the
+    container as a group (``memory.oom.group``).
+
+    Returns True if the limit was applied. On platforms without ``resource``/``RLIMIT_DATA``
+    (Windows) this is a no-op returning False: there the allocator already refuses
+    over-commitment at allocation time with a MemoryError, which is the behavior this
+    function exists to create.
+    """
+    if resource is None or not hasattr(resource, "RLIMIT_DATA"):
+        logger.info("set_process_memory_limit: not supported on this platform (no-op)")
+        return False
+    try:
+        # set only the SOFT limit and leave the hard limit untouched: the soft limit is
+        # what makes allocations fail, and an unprivileged process can adjust it freely,
+        # whereas lowering the hard limit is a one-way door (raising it back requires
+        # CAP_SYS_RESOURCE).
+        _, hard = resource.getrlimit(resource.RLIMIT_DATA)
+        resource.setrlimit(resource.RLIMIT_DATA, (int(nbytes), hard))
+    except (ValueError, OSError) as e:
+        logger.warning(f"set_process_memory_limit: could not set RLIMIT_DATA: {e}")
+        return False
+    logger.info(f"set_process_memory_limit: RLIMIT_DATA = {util.GB(int(nbytes))}")
+    return True
+
+
 def shared_memory_size(data_buffers):
     """
     return total size of the multiprocessing shared memory block in data_buffers

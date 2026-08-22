@@ -281,18 +281,28 @@ def compute_accessibility(
             orig_land_use_df_chunk = orig_land_use_df.loc[chooser_chunk.index]
         else:
             orig_land_use_df_chunk = None
-        accessibilities = compute_accessibilities_for_zones(
-            state,
-            chooser_chunk,
-            land_use_df,
-            orig_land_use_df_chunk,
-            assignment_spec,
-            constants,
-            network_los,
-            trace_label,
-            chunk_sizer,
+
+        def _work(chunk_df):
+            olu = (
+                orig_land_use_df.loc[chunk_df.index]
+                if orig_land_use_df is not None
+                else None
+            )
+            return compute_accessibilities_for_zones(
+                state,
+                chunk_df,
+                land_use_df,
+                olu,
+                assignment_spec,
+                constants,
+                network_los,
+                trace_label,
+                chunk_sizer,
+            )
+
+        accessibilities_list.extend(
+            chunk.run_with_memory_retry(_work, chooser_chunk, trace_label=trace_label)
         )
-        accessibilities_list.append(accessibilities)
 
     accessibility_df = pd.concat(accessibilities_list)
 

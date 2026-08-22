@@ -243,3 +243,36 @@ def test_auto_overrides_passed_static_chunk_size(state, monkeypatch):
         )
     ]
     assert len(chunks) == 1 and len(chunks[0]) == len(data)
+
+
+def test_run_with_memory_retry_splits_and_merges():
+    # first call on the full chunk fails; halves succeed; results come back in row order
+    data = pd.DataFrame({"x": range(100)})
+    calls = []
+
+    def work(chunk_df):
+        calls.append(len(chunk_df))
+        if len(chunk_df) > 60:
+            raise MemoryError("too big")
+        return chunk_df["x"].sum()
+
+    out = chunk.run_with_memory_retry(work, data, trace_label="t")
+    assert calls == [100, 50, 50]  # full attempt, then the two halves
+    assert sum(out) == data["x"].sum()  # nothing lost, nothing duplicated
+
+
+def test_run_with_memory_retry_exhaustion_reraises():
+    data = pd.DataFrame({"x": range(64)})
+
+    def always_fails(chunk_df):
+        raise MemoryError("always")
+
+    with pytest.raises(MemoryError):
+        chunk.run_with_memory_retry(always_fails, data, trace_label="t")
+
+
+def test_run_with_memory_retry_success_passthrough():
+    # no failure -> exactly one call, one result
+    data = pd.DataFrame({"x": range(10)})
+    out = chunk.run_with_memory_retry(lambda df: len(df), data)
+    assert out == [10]

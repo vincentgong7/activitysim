@@ -168,6 +168,59 @@ def log_chunking_settings(state: workflow.State) -> None:
     )
 
 
+# bounded halving depth for run_with_memory_retry (each level halves the chunk rows)
+MEMORY_RETRY_MAX_DEPTH = 3
+
+
+def run_with_memory_retry(work_fn, chooser_chunk, depth=0, trace_label=None):
+    """Run ``work_fn(chooser_chunk)``; on MemoryError, halve the chunk and retry.
+
+    Returns a LIST of work_fn results (one per surviving sub-chunk, in row order), so a
+    split chunk yields multiple results for the caller to concatenate exactly as it would
+    concatenate ordinary chunk results.
+
+    The retry deliberately happens AFTER the ``except`` block exits. While a MemoryError is
+    being handled, its traceback holds references to every frame below — including the
+    partially built arrays of the failed attempt — so ``gc.collect()`` inside the handler
+    cannot free them and any retry would run on top of that memory. Exiting the handler
+    first releases those frames; collection then genuinely reclaims the failed attempt
+    (verified empirically: retries that always failed inside the handler succeeded at the
+    first halving once moved outside it).
+
+    On Linux this pairs with ``mem.set_process_memory_limit``: with a per-process cap below
+    the container limit, an over-large allocation raises MemoryError here instead of pushing
+    the cgroup to its limit, where the kernel kills the whole container as a group. On
+    Windows the allocator already raises MemoryError on over-commitment, so this helper is
+    useful there without any cap. When the halving depth is exhausted the error re-raises —
+    behavior then degrades to today's clean failure, never anything worse.
+    """
+    import gc
+
+    failed = False
+    try:
+        return [work_fn(chooser_chunk)]
+    except MemoryError:
+        failed = True
+    assert failed
+    gc.collect()
+    if depth >= MEMORY_RETRY_MAX_DEPTH or len(chooser_chunk) <= 1:
+        raise MemoryError(
+            f"{trace_label or 'chunk'}: {len(chooser_chunk)} rows still exceed available "
+            f"memory at retry depth {depth}"
+        )
+    logger.warning(
+        f"{trace_label or 'chunk'}: MemoryError on {len(chooser_chunk)} rows; "
+        f"retrying in halves (depth {depth + 1})"
+    )
+    mid = len(chooser_chunk) // 2
+    out = []
+    for part in (chooser_chunk.iloc[:mid], chooser_chunk.iloc[mid:]):
+        out += run_with_memory_retry(
+            work_fn, part, depth=depth + 1, trace_label=trace_label
+        )
+    return out
+
+
 TRAINING_MODES = [
     MODE_RETRAIN,
     MODE_ADAPTIVE,
