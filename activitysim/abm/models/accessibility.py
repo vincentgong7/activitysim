@@ -301,7 +301,9 @@ def compute_accessibility(
             )
 
         accessibilities_list.extend(
-            chunk.run_with_memory_retry(_work, chooser_chunk, trace_label=trace_label)
+            chunk.run_with_memory_retry(
+                _work, chooser_chunk, state=state, trace_label=trace_label
+            )
         )
 
     accessibility_df = pd.concat(accessibilities_list)

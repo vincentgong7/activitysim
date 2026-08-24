@@ -643,7 +643,11 @@ def interaction_sample_simulate(
             )
 
         for choices in chunk.run_with_memory_retry_alts(
-            _work, chooser_chunk, alternative_chunk, trace_label=chunk_trace_label
+            _work,
+            chooser_chunk,
+            alternative_chunk,
+            state=state,
+            trace_label=chunk_trace_label,
         ):
             result_list.append(choices)
 

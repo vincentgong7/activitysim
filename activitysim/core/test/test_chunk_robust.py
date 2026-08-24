@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+import numpy.testing as npt
 import pandas as pd
 import pandas.testing as pdt
 import pytest
@@ -321,6 +323,83 @@ def test_run_with_memory_retry_alts_success_passthrough():
         lambda df, alt_df: (len(df), len(alt_df)), choosers, alts
     )
     assert out == [(len(choosers), len(alts))]
+
+
+def _rng_and_state(persons):
+    """A live random channel for `persons`, plus a minimal stand-in for the state object
+    the retry helper uses to reach it."""
+    from types import SimpleNamespace
+
+    from activitysim.core import random as asim_random
+
+    rng = asim_random.Random()
+    rng.set_base_seed(0)
+    rng.begin_step("test_step")
+    rng.add_channel("persons", persons)
+    return rng, SimpleNamespace(get_rn_generator=lambda: rng)
+
+
+def _persons(n=8):
+    return pd.DataFrame(
+        {"x": range(n)}, index=pd.Index(range(1, n + 1), name="person_id")
+    )
+
+
+def test_splitting_a_chunk_does_not_change_random_draws():
+    # each row is seeded from its own index, so halving a chunk must be invisible to the
+    # random streams. Everything else about the retry depends on this holding.
+    persons = _persons()
+    whole, _ = _rng_and_state(persons)
+    reference = whole.random_for_df(persons)
+
+    halves_rng, _ = _rng_and_state(persons)
+    halves = np.concatenate(
+        [
+            halves_rng.random_for_df(persons.iloc[:4]),
+            halves_rng.random_for_df(persons.iloc[4:]),
+        ]
+    )
+    npt.assert_array_equal(reference, halves)
+
+
+def test_retry_reproduces_draws_when_the_failed_attempt_already_drew():
+    # A failed attempt that got as far as drawing has advanced each row's offset. Without
+    # rewinding, the retry would continue the random stream instead of repeating it, and the
+    # run's results would depend on whether a MemoryError happened to occur.
+    persons = _persons()
+
+    def make_work(rng, fail_first):
+        calls = {"n": 0}
+
+        def work(chunk_df):
+            calls["n"] += 1
+            drawn = rng.random_for_df(chunk_df)
+            if calls["n"] == 1 and fail_first:
+                raise MemoryError("failed after drawing")
+            return drawn
+
+        return work
+
+    rng, state = _rng_and_state(persons)
+    reference = np.concatenate(
+        chunk.run_with_memory_retry(make_work(rng, False), persons, state=state)
+    )
+
+    rng, state = _rng_and_state(persons)
+    retried = np.concatenate(
+        chunk.run_with_memory_retry(
+            make_work(rng, True), persons, state=state, trace_label="t"
+        )
+    )
+
+    npt.assert_array_equal(reference, retried)
+
+
+def test_retry_without_state_still_runs():
+    # state is optional: callers whose work draws no random numbers need not supply it
+    persons = _persons(4)
+    out = chunk.run_with_memory_retry(lambda df: len(df), persons)
+    assert out == [4]
 
 
 def test_run_with_memory_retry_alts_exhaustion_reraises():

@@ -1075,7 +1075,7 @@ def interaction_simulate(
             )
 
         for choices in chunk.run_with_memory_retry(
-            _work, chooser_chunk, trace_label=chunk_trace_label
+            _work, chooser_chunk, state=state, trace_label=chunk_trace_label
         ):
             result_list.append(choices)
 

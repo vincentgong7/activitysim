@@ -172,7 +172,9 @@ def log_chunking_settings(state: workflow.State) -> None:
 MEMORY_RETRY_MAX_DEPTH = 3
 
 
-def run_with_memory_retry(work_fn, chooser_chunk, depth=0, trace_label=None):
+def run_with_memory_retry(
+    work_fn, chooser_chunk, state=None, depth=0, trace_label=None
+):
     """Run ``work_fn(chooser_chunk)``; on MemoryError, halve the chunk and retry.
 
     Returns a LIST of work_fn results (one per surviving sub-chunk, in row order), so a
@@ -187,6 +189,14 @@ def run_with_memory_retry(work_fn, chooser_chunk, depth=0, trace_label=None):
     (verified empirically: retries that always failed inside the handler succeeded at the
     first halving once moved outside it).
 
+    Pass ``state`` wherever the work draws random numbers. Splitting a chunk is by itself
+    invisible to the random streams, because each row is seeded from its own index — but an
+    attempt that failed *after* drawing has already advanced those rows' offsets, and without
+    rewinding them the retry would continue the stream instead of repeating it. Results would
+    then depend on whether a MemoryError happened to occur, which would cost reproducibility.
+    With ``state`` supplied the offsets are restored before the retry and the outcome matches
+    a run that never failed.
+
     On Linux this pairs with ``mem.set_process_memory_limit``: with a per-process cap below
     the container limit, an over-large allocation raises MemoryError here instead of pushing
     the cgroup to its limit, where the kernel kills the whole container as a group. On
@@ -194,20 +204,61 @@ def run_with_memory_retry(work_fn, chooser_chunk, depth=0, trace_label=None):
     useful there without any cap. When the halving depth is exhausted the error re-raises —
     behavior then degrades to today's clean failure, never anything worse.
     """
+    rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
         return [work_fn(chooser_chunk)]
     except MemoryError:
         failed = True
     assert failed
+    _restore_rng_offsets(rng_offsets)
     _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
     mid = len(chooser_chunk) // 2
     out = []
     for part in (chooser_chunk.iloc[:mid], chooser_chunk.iloc[mid:]):
         out += run_with_memory_retry(
-            work_fn, part, depth=depth + 1, trace_label=trace_label
+            work_fn, part, state=state, depth=depth + 1, trace_label=trace_label
         )
     return out
+
+
+def _rng_offsets(state, chooser_chunk):
+    """Snapshot the random-stream position of this chunk's rows, or None.
+
+    Each row's draws are seeded from its own index, so splitting a chunk does not by itself
+    change any random number. What does change them is a failed attempt that already drew:
+    drawing advances a per-row offset, so a retry would continue the stream instead of
+    repeating it, and the run's results would silently depend on whether a MemoryError
+    happened to occur. Capturing the offsets here lets the retry start from the same position
+    the failed attempt did, which keeps results identical to a run that never failed.
+
+    Only this chunk's rows are copied, so the cost is proportional to the chunk rather than to
+    the table. Returns None when there is nothing to restore — no state, no random channel for
+    this index (the chunk's rows are not a random domain), or offsets not yet initialized.
+    """
+    if state is None:
+        return None
+    try:
+        channel = state.get_rn_generator().get_channel_for_df(chooser_chunk)
+        offsets = channel.row_states.loc[chooser_chunk.index, "offset"]
+    except Exception:
+        # never let bookkeeping break the work it is protecting
+        return None
+    return channel, offsets.copy()
+
+
+def _restore_rng_offsets(snapshot):
+    """Rewind the random streams to where ``_rng_offsets`` captured them."""
+    if snapshot is None:
+        return
+    channel, offsets = snapshot
+    try:
+        channel.row_states.loc[offsets.index, "offset"] = offsets
+    except Exception:
+        logger.warning(
+            "could not restore random number offsets after a MemoryError; results of the "
+            "retried chunk may differ from an unfailed run"
+        )
 
 
 def _reclaim_or_give_up(num_rows, depth, trace_label):
@@ -231,7 +282,7 @@ def _reclaim_or_give_up(num_rows, depth, trace_label):
 
 
 def run_with_memory_retry_alts(
-    work_fn, chooser_chunk, alt_chunk, depth=0, trace_label=None
+    work_fn, chooser_chunk, alt_chunk, state=None, depth=0, trace_label=None
 ):
     """Like ``run_with_memory_retry``, for work that consumes choosers AND their alternatives.
 
@@ -241,13 +292,18 @@ def run_with_memory_retry_alts(
     cut in half themselves. Selecting the alternatives whose index falls in the chooser half
     preserves both the pairing and the original row order (alternatives appear in chooser
     order), which is what the downstream interaction code relies on.
+
+    ``state`` serves the same purpose as in ``run_with_memory_retry``: it lets a failed
+    attempt's random draws be rewound so the retry reproduces an unfailed run.
     """
+    rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
         return [work_fn(chooser_chunk, alt_chunk)]
     except MemoryError:
         failed = True
     assert failed
+    _restore_rng_offsets(rng_offsets)
     _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
     mid = len(chooser_chunk) // 2
     out = []
@@ -256,6 +312,7 @@ def run_with_memory_retry_alts(
             work_fn,
             part,
             alt_chunk[alt_chunk.index.isin(part.index)],
+            state=state,
             depth=depth + 1,
             trace_label=trace_label,
         )
