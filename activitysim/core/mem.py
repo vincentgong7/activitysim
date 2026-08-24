@@ -396,28 +396,71 @@ def get_peak_rss() -> int:
     return int(maxrss) * 1024 if sys.platform.startswith("linux") else int(maxrss)
 
 
-# Fraction of the container memory limit that all workers together may hold as anonymous
+# Fraction of the memory still AVAILABLE that all workers together may hold as anonymous
 # memory when memory_fail_recovery is enabled: each worker's cap is
-# WORKER_MEMORY_CAP_RATIO * limit / num_processes. The remainder is headroom for the main
-# process; page cache is reclaimable and cannot itself trigger the kernel OOM killer, so
-# with this in place the workers cannot collectively push the cgroup to a group kill —
-# an over-large allocation fails inside the offending worker as a catchable MemoryError
-# first. This is an insurance ceiling, deliberately independent of the per-component chunk
-# budget: if the budget calculation is ever wrong, the ceiling still holds.
+# WORKER_MEMORY_CAP_RATIO * available / num_processes.
+#
+# Available, not the whole limit. RLIMIT_DATA meters only anonymous memory, so everything
+# already charged to the cgroup when the workers start — shared skim buffers in /dev/shm,
+# the parent's own footprint, page cache — sits outside every worker's cap while still
+# counting toward the limit the kernel enforces. Sizing the caps against the raw limit
+# would let N * cap plus that resident floor exceed the limit, and the container would be
+# group-killed before any worker ever reached its cap: an insurance ceiling that cannot pay
+# out. On a Rotterdam-scale run the floor is dominated by ~38 GB of shared skims, so this
+# is the difference between the mechanism working and doing nothing at all.
+#
+# This still does NOT couple the ceiling to the per-component chunk budget — it shares only
+# the same reading of what memory exists, which is an input to both. If the budget
+# calculation is ever wrong, the ceiling still holds.
 WORKER_MEMORY_CAP_RATIO = 0.9
+
+# A cap must leave a worker meaningfully more room than it already occupies; one at or below
+# its current footprint makes the first allocation fail and every halved retry fail with it
+# (observed directly: a cap under the baseline working set turns recovery into a guaranteed
+# clean failure). Below this multiple of the worker's own data segment we decline to set a
+# cap at all and say so, rather than arm a ceiling that can only misfire. A sanity floor,
+# not a tuned value.
+WORKER_MEMORY_CAP_MIN_HEADROOM = 2.0
+
+
+def _own_data_segment() -> int | None:
+    """This process's anonymous footprint in bytes — the quantity RLIMIT_DATA meters."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmData:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def worker_memory_cap(num_processes: int) -> int:
     """The per-worker anonymous-memory cap for memory_fail_recovery, in bytes.
 
-    cap = WORKER_MEMORY_CAP_RATIO * memory_limit / num_processes. Memory-mapped skims are
-    exempt from the cap by nature (RLIMIT_DATA does not count file-backed mappings), so
-    they need no allowance here.
+    ``cap = WORKER_MEMORY_CAP_RATIO * available / num_processes``, where available is what
+    is left under the ceiling once the resident floor is accounted for — see the note on
+    WORKER_MEMORY_CAP_RATIO for why this is measured against available rather than the whole
+    limit. Memory-mapped skims are exempt from the cap by nature (RLIMIT_DATA does not count
+    file-backed mappings), so they need no separate allowance.
+
+    Returns 0 when no cap should be set: the available memory cannot be determined, or the
+    share works out too small to be usable.
     """
-    limit = get_memory_limit()
-    if not limit:
+    available = get_available_memory()
+    if not available:
         return 0
-    return int(WORKER_MEMORY_CAP_RATIO * limit / max(int(num_processes), 1))
+    cap = int(WORKER_MEMORY_CAP_RATIO * available / max(int(num_processes), 1))
+    own = _own_data_segment()
+    if own and cap < own * WORKER_MEMORY_CAP_MIN_HEADROOM:
+        logger.warning(
+            f"memory_fail_recovery: not capping this worker — a share of "
+            f"{util.GB(cap)} leaves too little over its current {util.GB(own)} to work in. "
+            "Recovery is disabled for this process; consider fewer workers or a larger "
+            "memory limit."
+        )
+        return 0
+    return cap
 
 
 def set_process_memory_limit(nbytes: int) -> bool:

@@ -125,18 +125,54 @@ def test_set_process_memory_limit_noop_without_resource(monkeypatch):
     assert mem.set_process_memory_limit(1 * GIB) is False
 
 
-def test_worker_memory_cap_formula(tmp_path):
-    # cap = 0.9 * limit / workers, derived from the cgroup limit (reuses get_memory_limit)
-    root = str(tmp_path)
-    _write(root, "memory.max", str(40 * GIB))
+def test_worker_memory_cap_formula():
+    # cap = 0.9 * AVAILABLE / workers -- available, not the raw limit, so that memory already
+    # resident when the workers start is outside every cap instead of being handed out N times
     import unittest.mock as um
 
-    with um.patch.object(mem, "get_memory_limit", lambda **kw: 40 * GIB):
+    with um.patch.object(mem, "get_available_memory", lambda **kw: 40 * GIB):
         assert mem.worker_memory_cap(4) == int(0.9 * 40 * GIB / 4)
         assert mem.worker_memory_cap(1) == int(0.9 * 40 * GIB)
         assert mem.worker_memory_cap(0) == int(0.9 * 40 * GIB)  # clamped to >= 1 worker
-    with um.patch.object(mem, "get_memory_limit", lambda **kw: 0):
-        assert mem.worker_memory_cap(4) == 0  # unknown limit -> no cap
+    with um.patch.object(mem, "get_available_memory", lambda **kw: 0):
+        assert mem.worker_memory_cap(4) == 0  # unknown/none available -> no cap
+
+
+def test_worker_memory_cap_excludes_the_resident_floor():
+    # the case this formula exists for: a 60 GiB limit with ~38 GiB of shared skims already
+    # resident. Sizing against the limit would permit 6 * 9 = 54 GiB of anonymous memory on
+    # top of the skims -- far past the limit, so the container is group-killed before any
+    # worker reaches its cap. Sizing against what is available cannot exceed the limit.
+    import unittest.mock as um
+
+    limit = 60 * GIB
+    resident = 38 * GIB  # shared skims, parent process, page cache
+    workers = 6
+
+    with um.patch.object(mem, "get_available_memory", lambda **kw: limit - resident):
+        cap = mem.worker_memory_cap(workers)
+
+    assert workers * cap + resident < limit
+
+
+def test_worker_memory_cap_declines_when_the_share_is_too_small():
+    # a cap at or below what the worker already holds makes the first allocation fail and
+    # every halved retry fail with it; decline instead of arming a ceiling that can only
+    # misfire
+    import unittest.mock as um
+
+    with um.patch.object(
+        mem, "get_available_memory", lambda **kw: 2 * GIB
+    ), um.patch.object(mem, "_own_data_segment", lambda: 1 * GIB):
+        # share is 0.9 * 2 GiB / 8 = 230 MiB against a 1 GiB footprint -> refuse
+        assert mem.worker_memory_cap(8) == 0
+        # share is 0.9 * 2 GiB = 1.8 GiB against the same footprint -> still under 2x, refuse
+        assert mem.worker_memory_cap(1) == 0
+
+    with um.patch.object(
+        mem, "get_available_memory", lambda **kw: 40 * GIB
+    ), um.patch.object(mem, "_own_data_segment", lambda: 1 * GIB):
+        assert mem.worker_memory_cap(4) > 0  # plenty of headroom -> cap normally
 
 
 def test_memory_fail_recovery_defaults_off():
