@@ -1056,25 +1056,30 @@ def interaction_simulate(
     ) in chunk.adaptive_chunked_choosers(
         state, choosers, trace_label, explicit_chunk_size=explicit_chunk_size
     ):
-        choices = _interaction_simulate(
-            state,
-            chooser_chunk,
-            alternatives,
-            spec,
-            skims=skims,
-            locals_d=locals_d,
-            sample_size=sample_size,
-            trace_label=chunk_trace_label,
-            trace_choice_name=trace_choice_name,
-            log_alt_losers=log_alt_losers,
-            estimator=estimator,
-            chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-        )
 
-        result_list.append(choices)
+        def _work(chunk_df):
+            return _interaction_simulate(
+                state,
+                chunk_df,
+                alternatives,
+                spec,
+                skims=skims,
+                locals_d=locals_d,
+                sample_size=sample_size,
+                trace_label=chunk_trace_label,
+                trace_choice_name=trace_choice_name,
+                log_alt_losers=log_alt_losers,
+                estimator=estimator,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+            )
 
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+        for choices in chunk.run_with_memory_retry(
+            _work, chooser_chunk, trace_label=chunk_trace_label
+        ):
+            result_list.append(choices)
+
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:

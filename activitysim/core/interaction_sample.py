@@ -1129,30 +1129,35 @@ def interaction_sample(
     ) in chunk.adaptive_chunked_choosers(
         state, choosers, trace_label, chunk_tag, explicit_chunk_size=explicit_chunk_size
     ):
-        choices = _interaction_sample(
-            state,
-            chooser_chunk,
-            alternatives,
-            spec=spec,
-            sample_size=sample_size,
-            alt_col_name=alt_col_name,
-            allow_zero_probs=allow_zero_probs,
-            log_alt_losers=log_alt_losers,
-            skims=skims,
-            locals_d=locals_d,
-            trace_label=chunk_trace_label,
-            zone_layer=zone_layer,
-            chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-            stable_alt_positions=stable_alt_positions,
-            n_total_alts=n_total_alts,
-        )
 
-        if choices.shape[0] > 0:
-            # might not be any if allow_zero_probs
-            result_list.append(choices)
+        def _work(chunk_df):
+            return _interaction_sample(
+                state,
+                chunk_df,
+                alternatives,
+                spec=spec,
+                sample_size=sample_size,
+                alt_col_name=alt_col_name,
+                allow_zero_probs=allow_zero_probs,
+                log_alt_losers=log_alt_losers,
+                skims=skims,
+                locals_d=locals_d,
+                trace_label=chunk_trace_label,
+                zone_layer=zone_layer,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+                stable_alt_positions=stable_alt_positions,
+                n_total_alts=n_total_alts,
+            )
 
-            chunk_sizer.log_df(trace_label, f"result_list", result_list)
+        for choices in chunk.run_with_memory_retry(
+            _work, chooser_chunk, trace_label=chunk_trace_label
+        ):
+            if choices.shape[0] > 0:
+                # might not be any if allow_zero_probs
+                result_list.append(choices)
+
+                chunk_sizer.log_df(trace_label, f"result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:

@@ -619,30 +619,35 @@ def interaction_sample_simulate(
         chunk_size=chunk_size,
         explicit_chunk_size=explicit_chunk_size,
     ):
-        choices = _interaction_sample_simulate(
-            state,
-            chooser_chunk,
-            alternative_chunk,
-            spec,
-            choice_column,
-            allow_zero_probs,
-            zero_prob_choice_val,
-            log_alt_losers,
-            want_logsums,
-            skims,
-            locals_d,
-            chunk_trace_label,
-            trace_choice_name,
-            estimator,
-            skip_choice,
-            chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-            alts_context=alts_context,
-        )
 
-        result_list.append(choices)
+        def _work(chunk_df, alt_df):
+            return _interaction_sample_simulate(
+                state,
+                chunk_df,
+                alt_df,
+                spec,
+                choice_column,
+                allow_zero_probs,
+                zero_prob_choice_val,
+                log_alt_losers,
+                want_logsums,
+                skims,
+                locals_d,
+                chunk_trace_label,
+                trace_choice_name,
+                estimator,
+                skip_choice,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+                alts_context=alts_context,
+            )
 
-        chunk_sizer.log_df(trace_label, f"result_list", result_list)
+        for choices in chunk.run_with_memory_retry_alts(
+            _work, chooser_chunk, alternative_chunk, trace_label=chunk_trace_label
+        ):
+            result_list.append(choices)
+
+            chunk_sizer.log_df(trace_label, f"result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:

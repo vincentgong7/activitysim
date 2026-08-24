@@ -276,3 +276,58 @@ def test_run_with_memory_retry_success_passthrough():
     data = pd.DataFrame({"x": range(10)})
     out = chunk.run_with_memory_retry(lambda df: len(df), data)
     assert out == [10]
+
+
+def _choosers_and_sampled_alts(n=8):
+    """A chooser table and a sampled-alternatives table shaped like the real ones:
+    one row per (chooser, alternative), indexed by chooser id, varying counts per
+    chooser, laid out in chooser order."""
+    choosers = pd.DataFrame(
+        {"c": range(n)}, index=pd.Index(range(n), name="chooser_id")
+    )
+    alt_index = []
+    for chooser_id in choosers.index:
+        alt_index += [chooser_id] * (chooser_id % 3 + 1)
+    alts = pd.DataFrame(
+        {"a": range(len(alt_index))}, index=pd.Index(alt_index, name="chooser_id")
+    )
+    return choosers, alts
+
+
+def test_run_with_memory_retry_alts_keeps_alts_with_their_choosers():
+    # the alternatives must follow their choosers into the halves; cutting them in half
+    # independently would mis-pair them
+    choosers, alts = _choosers_and_sampled_alts(8)
+    chooser_counts = []
+
+    def work(chunk_df, alt_df):
+        chooser_counts.append(len(chunk_df))
+        if len(chunk_df) > 4:
+            raise MemoryError("too big")
+        # no alternative may arrive without its chooser, and none may go missing
+        assert set(alt_df.index) == set(chunk_df.index)
+        return alt_df["a"].tolist()
+
+    out = chunk.run_with_memory_retry_alts(work, choosers, alts, trace_label="t")
+
+    assert chooser_counts == [8, 4, 4]  # full attempt, then the two halves
+    # every alternative row appears exactly once, in the original order
+    assert [a for part in out for a in part] == alts["a"].tolist()
+
+
+def test_run_with_memory_retry_alts_success_passthrough():
+    choosers, alts = _choosers_and_sampled_alts(6)
+    out = chunk.run_with_memory_retry_alts(
+        lambda df, alt_df: (len(df), len(alt_df)), choosers, alts
+    )
+    assert out == [(len(choosers), len(alts))]
+
+
+def test_run_with_memory_retry_alts_exhaustion_reraises():
+    choosers, alts = _choosers_and_sampled_alts(8)
+
+    def always_fails(chunk_df, alt_df):
+        raise MemoryError("always")
+
+    with pytest.raises(MemoryError):
+        chunk.run_with_memory_retry_alts(always_fails, choosers, alts, trace_label="t")

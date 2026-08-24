@@ -194,29 +194,70 @@ def run_with_memory_retry(work_fn, chooser_chunk, depth=0, trace_label=None):
     useful there without any cap. When the halving depth is exhausted the error re-raises —
     behavior then degrades to today's clean failure, never anything worse.
     """
-    import gc
-
     failed = False
     try:
         return [work_fn(chooser_chunk)]
     except MemoryError:
         failed = True
     assert failed
-    gc.collect()
-    if depth >= MEMORY_RETRY_MAX_DEPTH or len(chooser_chunk) <= 1:
-        raise MemoryError(
-            f"{trace_label or 'chunk'}: {len(chooser_chunk)} rows still exceed available "
-            f"memory at retry depth {depth}"
-        )
-    logger.warning(
-        f"{trace_label or 'chunk'}: MemoryError on {len(chooser_chunk)} rows; "
-        f"retrying in halves (depth {depth + 1})"
-    )
+    _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
     mid = len(chooser_chunk) // 2
     out = []
     for part in (chooser_chunk.iloc[:mid], chooser_chunk.iloc[mid:]):
         out += run_with_memory_retry(
             work_fn, part, depth=depth + 1, trace_label=trace_label
+        )
+    return out
+
+
+def _reclaim_or_give_up(num_rows, depth, trace_label):
+    """Reclaim a failed attempt and decide whether another halving is allowed.
+
+    MUST be called after the ``except`` block has exited, never inside it — see the note in
+    ``run_with_memory_retry`` about the traceback pinning the failed attempt's frames.
+    """
+    import gc
+
+    gc.collect()
+    if depth >= MEMORY_RETRY_MAX_DEPTH or num_rows <= 1:
+        raise MemoryError(
+            f"{trace_label or 'chunk'}: {num_rows} rows still exceed available "
+            f"memory at retry depth {depth}"
+        )
+    logger.warning(
+        f"{trace_label or 'chunk'}: MemoryError on {num_rows} rows; "
+        f"retrying in halves (depth {depth + 1})"
+    )
+
+
+def run_with_memory_retry_alts(
+    work_fn, chooser_chunk, alt_chunk, depth=0, trace_label=None
+):
+    """Like ``run_with_memory_retry``, for work that consumes choosers AND their alternatives.
+
+    ``work_fn(chooser_chunk, alt_chunk)`` is called with matching slices. Sampled-alternative
+    tables carry one row per (chooser, alternative) pair and are indexed by the chooser id, so
+    when the choosers are halved the alternatives must follow their choosers rather than being
+    cut in half themselves. Selecting the alternatives whose index falls in the chooser half
+    preserves both the pairing and the original row order (alternatives appear in chooser
+    order), which is what the downstream interaction code relies on.
+    """
+    failed = False
+    try:
+        return [work_fn(chooser_chunk, alt_chunk)]
+    except MemoryError:
+        failed = True
+    assert failed
+    _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
+    mid = len(chooser_chunk) // 2
+    out = []
+    for part in (chooser_chunk.iloc[:mid], chooser_chunk.iloc[mid:]):
+        out += run_with_memory_retry_alts(
+            work_fn,
+            part,
+            alt_chunk[alt_chunk.index.isin(part.index)],
+            depth=depth + 1,
+            trace_label=trace_label,
         )
     return out
 
