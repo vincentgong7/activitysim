@@ -203,6 +203,10 @@ def run_with_memory_retry(
     With ``state`` supplied the offsets are restored before the retry and the outcome matches
     a run that never failed.
 
+    NOT for callers that chunk by ``chunk_id``: those group several rows that must stay
+    together in one chunk (all the persons of a household, say), and halving on row position
+    would cut a group in half. Such loops need a group-aware split before they can use this.
+
     On Linux this pairs with ``mem.set_process_memory_limit``: with a per-process cap below
     the container limit, an over-large allocation raises MemoryError here instead of pushing
     the cgroup to its limit, where the kernel kills the whole container as a group. On

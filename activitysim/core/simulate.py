@@ -1870,27 +1870,36 @@ def simple_simulate(
     ) in chunk.adaptive_chunked_choosers(
         state, choosers, trace_label, explicit_chunk_size=explicit_chunk_size
     ):
-        choices = _simple_simulate(
-            state,
+
+        def _work(chunk_df):
+            return _simple_simulate(
+                state,
+                chunk_df,
+                spec,
+                nest_spec,
+                skims=skims,
+                locals_d=locals_d,
+                custom_chooser=custom_chooser,
+                log_alt_losers=log_alt_losers,
+                want_logsums=want_logsums,
+                estimator=estimator,
+                trace_label=chunk_trace_label,
+                trace_choice_name=trace_choice_name,
+                trace_column_names=trace_column_names,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+            )
+
+        for choices in chunk.run_with_memory_retry(
+            _work,
             chooser_chunk,
-            spec,
-            nest_spec,
-            skims=skims,
-            locals_d=locals_d,
-            custom_chooser=custom_chooser,
-            log_alt_losers=log_alt_losers,
-            want_logsums=want_logsums,
-            estimator=estimator,
-            trace_label=chunk_trace_label,
-            trace_choice_name=trace_choice_name,
-            trace_column_names=trace_column_names,
+            state=state,
             chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-        )
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(choices)
 
-        result_list.append(choices)
-
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     if len(result_list) > 1:
         choices = pd.concat(result_list)
@@ -2206,21 +2215,30 @@ def simple_simulate_logsums(
         chunk_size=chunk_size,
         explicit_chunk_size=explicit_chunk_size,
     ):
-        logsums = _simple_simulate_logsums(
-            state,
+
+        def _work(chunk_df):
+            return _simple_simulate_logsums(
+                state,
+                chunk_df,
+                spec,
+                nest_spec,
+                skims,
+                locals_d,
+                chunk_trace_label,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+            )
+
+        for logsums in chunk.run_with_memory_retry(
+            _work,
             chooser_chunk,
-            spec,
-            nest_spec,
-            skims,
-            locals_d,
-            chunk_trace_label,
+            state=state,
             chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-        )
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(logsums)
 
-        result_list.append(logsums)
-
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     if len(result_list) > 1:
         logsums = pd.concat(result_list)
