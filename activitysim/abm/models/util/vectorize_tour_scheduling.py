@@ -969,27 +969,40 @@ def schedule_tours(
         tour_chunk_tag,
         explicit_chunk_size=model_settings.explicit_chunk,
     ):
-        choices = _schedule_tours(
-            state,
+
+        def _work(chunk_df):
+            return _schedule_tours(
+                state,
+                chunk_df,
+                persons_merged,
+                alts,
+                spec,
+                logsum_tour_purpose,
+                model_settings,
+                timetable,
+                timetable_window_id_col,
+                previous_tour,
+                tour_owner_id_col,
+                estimator,
+                tour_trace_label=chunk_trace_label,
+                compute_settings=compute_settings,
+                chunk_sizer=chunk_sizer,
+            )
+
+        # Halving a chunk here is safe: the caller guarantees at most one tour per timetable
+        # window per call, so the tours within a chunk belong to different windows and cannot
+        # influence one another. A sub-chunk is a contiguous slice, so it keeps the monotonic
+        # index the routine asserts on.
+        for choices in chunk.run_with_memory_retry(
+            _work,
             chooser_chunk,
-            persons_merged,
-            alts,
-            spec,
-            logsum_tour_purpose,
-            model_settings,
-            timetable,
-            timetable_window_id_col,
-            previous_tour,
-            tour_owner_id_col,
-            estimator,
-            tour_trace_label=chunk_trace_label,
-            compute_settings=compute_settings,
+            state=state,
             chunk_sizer=chunk_sizer,
-        )
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(choices)
 
-        result_list.append(choices)
-
-        chunk_sizer.log_df(tour_trace_label, "result_list", result_list)
+            chunk_sizer.log_df(tour_trace_label, "result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:
