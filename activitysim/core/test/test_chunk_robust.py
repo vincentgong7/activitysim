@@ -471,6 +471,40 @@ def test_reporting_failure_never_breaks_the_run():
     assert sum(out) == 40
 
 
+def test_cap_is_armed_only_where_a_retry_can_catch_it():
+    # a cap around work with no handler turns a survivable allocation into a failed run, so
+    # it belongs inside the retry rather than around every chunk loop
+    from types import SimpleNamespace
+
+    armed = []
+
+    class _Cap:
+        def __enter__(self):
+            armed.append(True)
+
+        def __exit__(self, *a):
+            return False
+
+    state = SimpleNamespace(
+        settings=SimpleNamespace(memory_fail_recovery=True, multiprocess=False),
+        get_injectable=lambda *a, **k: None,
+    )
+    data = pd.DataFrame({"x": range(10)})
+
+    import unittest.mock as um
+
+    with um.patch.object(chunk.mem, "memory_cap", lambda **kw: _Cap()):
+        chunk.run_with_memory_retry(lambda df: len(df), data, state=state)
+    assert armed, "the cap must be armed around the attempt"
+
+    # switched off -> no cap at all
+    armed.clear()
+    state.settings.memory_fail_recovery = False
+    with um.patch.object(chunk.mem, "memory_cap", lambda **kw: _Cap()):
+        chunk.run_with_memory_retry(lambda df: len(df), data, state=state)
+    assert not armed
+
+
 def test_retry_without_state_still_runs():
     # state is optional: callers whose work draws no random numbers need not supply it
     persons = _persons(4)

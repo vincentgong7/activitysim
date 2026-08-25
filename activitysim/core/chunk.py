@@ -173,8 +173,24 @@ def log_chunking_settings(state: workflow.State) -> None:
 MEMORY_RETRY_MAX_DEPTH = 3
 
 
-def _recovery_enabled(state) -> bool:
-    return bool(getattr(state.settings, "memory_fail_recovery", False))
+def _cap_for_chunk_work(state, trace_label):
+    """Arm the per-worker cap around one attempt at a chunk, if recovery is enabled.
+
+    Deliberately armed HERE rather than around every chunk loop. A cap is only ever an
+    improvement where a failure has somewhere to go: this helper catches the MemoryError and
+    halves the chunk. Arming it around a loop that has no such handler converts an allocation
+    that would have succeeded into an unhandled failure -- observed directly, on a run that
+    reached mandatory_tour_scheduling and then died on a 2.15 GB allocation in a chunk loop
+    that had the cap but not the retry.
+    """
+    settings = getattr(state, "settings", None) if state is not None else None
+    if not getattr(settings, "memory_fail_recovery", False):
+        return contextlib.nullcontext()
+    try:
+        divisor = _worker_count(state)
+    except Exception:
+        divisor = 1
+    return mem.memory_cap(divisor=divisor, trace_label=trace_label)
 
 
 def _worker_count(state) -> int:
@@ -183,13 +199,14 @@ def _worker_count(state) -> int:
     ``state.settings.num_processes`` is 0 when the count is auto-derived, so a worker reading
     it would divide by 1 and claim the whole allowance for itself.
     """
-    if not getattr(state.settings, "multiprocess", False):
+    settings = getattr(state, "settings", None)
+    if not getattr(settings, "multiprocess", False):
         return 1
     try:
         injected = state.get_injectable("num_processes", None)
     except Exception:
         injected = None
-    return int(injected or getattr(state.settings, "num_processes", 1) or 1)
+    return int(injected or getattr(settings, "num_processes", 1) or 1)
 
 
 def run_with_memory_retry(
@@ -240,7 +257,8 @@ def run_with_memory_retry(
     rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
-        out = [work_fn(chooser_chunk)]
+        with _cap_for_chunk_work(state, trace_label):
+            out = [work_fn(chooser_chunk)]
         _workable.append(len(chooser_chunk))
         return out
     except MemoryError:
@@ -366,7 +384,8 @@ def run_with_memory_retry_alts(
     rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
-        out = [work_fn(chooser_chunk, alt_chunk)]
+        with _cap_for_chunk_work(state, trace_label):
+            out = [work_fn(chooser_chunk, alt_chunk)]
         _workable.append(len(chooser_chunk))
         return out
     except MemoryError:
@@ -1588,15 +1607,7 @@ class ChunkSizer:
             log_rss(
                 self.state, self.trace_label, force=True
             )  # make sure we get at least one reading
-            # One chunk's work is exactly the scope memory-fail recovery can rescue, so the
-            # cap is armed here and lifted again on the way out. Work outside this block --
-            # the joins and concatenations that build and consume the chunked results -- runs
-            # under whatever cap the caller had, because a cap there could only make an
-            # allocation fail that has no smaller form to retry.
-            with mem.memory_cap(
-                divisor=_worker_count(self.state), trace_label=self.trace_label
-            ) if _recovery_enabled(self.state) else contextlib.nullcontext():
-                yield
+            yield
             log_rss(
                 self.state, self.trace_label, force=True
             )  # make sure we get at least one reading
