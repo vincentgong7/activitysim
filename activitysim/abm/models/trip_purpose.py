@@ -271,21 +271,31 @@ def run_trip_purpose(
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers(state, trips_df, chunk_tag, trace_label):
-        choices = choose_intermediate_trip_purpose(
-            state,
-            trips_chunk,
-            probs_spec,
-            estimator,
-            probs_join_cols=probs_join_cols,
-            use_depart_time=use_depart_time,
-            trace_hh_id=state.settings.trace_hh_id,
-            trace_label=chunk_trace_label,
-            chunk_sizer=chunk_sizer,
-        )
-        print(choices.value_counts(dropna=False))
-        result_list.append(choices)
 
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+        def _work(chunk_df):
+            return choose_intermediate_trip_purpose(
+                state,
+                chunk_df,
+                probs_spec,
+                estimator,
+                probs_join_cols=probs_join_cols,
+                use_depart_time=use_depart_time,
+                trace_hh_id=state.settings.trace_hh_id,
+                trace_label=chunk_trace_label,
+                chunk_sizer=chunk_sizer,
+            )
+
+        for choices in chunk.run_with_memory_retry(
+            _work,
+            trips_chunk,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            trace_label=chunk_trace_label,
+        ):
+            print(choices.value_counts(dropna=False))
+            result_list.append(choices)
+
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     if len(result_list) > 1:
         choices = pd.concat(result_list)

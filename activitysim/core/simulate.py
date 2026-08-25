@@ -1935,26 +1935,36 @@ def simple_simulate_by_chunk_id(
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers_by_chunk_id(state, choosers, trace_label):
-        choices = _simple_simulate(
-            state,
+
+        def _work(chunk_df):
+            return _simple_simulate(
+                state,
+                chunk_df,
+                spec,
+                nest_spec,
+                skims=skims,
+                locals_d=locals_d,
+                custom_chooser=custom_chooser,
+                log_alt_losers=log_alt_losers,
+                want_logsums=want_logsums,
+                estimator=estimator,
+                trace_label=chunk_trace_label,
+                trace_choice_name=trace_choice_name,
+                chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
+            )
+
+        # chunked by chunk_id, so the split has to fall on a group boundary
+        for choices in chunk.run_with_memory_retry_by_group(
+            _work,
             chooser_chunk,
-            spec,
-            nest_spec,
-            skims=skims,
-            locals_d=locals_d,
-            custom_chooser=custom_chooser,
-            log_alt_losers=log_alt_losers,
-            want_logsums=want_logsums,
-            estimator=estimator,
-            trace_label=chunk_trace_label,
-            trace_choice_name=trace_choice_name,
+            state=state,
             chunk_sizer=chunk_sizer,
-            compute_settings=compute_settings,
-        )
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(choices)
 
-        result_list.append(choices)
-
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     if len(result_list) > 1:
         choices = pd.concat(result_list)

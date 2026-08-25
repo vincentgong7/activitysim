@@ -505,6 +505,38 @@ def test_cap_is_armed_only_where_a_retry_can_catch_it():
     assert not armed
 
 
+def test_group_split_never_cuts_a_group_in_half():
+    # rows sharing a chunk_id are one unit of work -- all the persons of a household -- and
+    # half a household is not a smaller version of the problem, so the split falls on group
+    # boundaries rather than row positions
+    rows = []
+    for gid in range(8):
+        rows += [{"chunk_id": gid, "person": f"{gid}-{k}"} for k in range(3)]
+    data = pd.DataFrame(rows)
+
+    def work(chunk_df):
+        # every group this attempt sees must be whole
+        sizes = chunk_df.groupby("chunk_id").size()
+        assert (sizes == 3).all(), f"a group arrived partially: {sizes.to_dict()}"
+        if chunk_df["chunk_id"].nunique() > 2:
+            raise MemoryError("too many groups")
+        return len(chunk_df)
+
+    out = chunk.run_with_memory_retry_by_group(work, data, trace_label="t")
+    assert sum(out) == len(data)  # every row processed exactly once
+
+
+def test_group_split_reraises_on_a_single_group():
+    # one group that will not fit cannot be made smaller; failing is the honest outcome
+    data = pd.DataFrame({"chunk_id": [7, 7, 7], "x": [1, 2, 3]})
+
+    def always_fails(chunk_df):
+        raise MemoryError("nope")
+
+    with pytest.raises(MemoryError, match="cannot be split"):
+        chunk.run_with_memory_retry_by_group(always_fails, data, trace_label="t")
+
+
 def test_retry_without_state_still_runs():
     # state is optional: callers whose work draws no random numbers need not supply it
     persons = _persons(4)

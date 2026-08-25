@@ -50,21 +50,31 @@ def run_tour_scheduling_probabilistic(
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers(state, tours_df, trace_label, trace_label):
-        choices = ps.make_scheduling_choices(
-            state,
+
+        def _work(chunk_df):
+            return ps.make_scheduling_choices(
+                state,
+                chunk_df,
+                "departure",
+                scheduling_probs,
+                probs_join_cols,
+                depart_alt_base,
+                first_trip_in_leg=False,
+                report_failed_trips=True,
+                trace_label=chunk_trace_label,
+                trace_choice_col_name="depart_return",
+                clip_earliest_latest=False,
+                chunk_sizer=chunk_sizer,
+            )
+
+        for choices in chunk.run_with_memory_retry(
+            _work,
             chooser_chunk,
-            "departure",
-            scheduling_probs,
-            probs_join_cols,
-            depart_alt_base,
-            first_trip_in_leg=False,
-            report_failed_trips=True,
-            trace_label=chunk_trace_label,
-            trace_choice_col_name="depart_return",
-            clip_earliest_latest=False,
+            state=state,
             chunk_sizer=chunk_sizer,
-        )
-        result_list.append(choices)
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(choices)
 
     choices = pd.concat(result_list)
     return choices

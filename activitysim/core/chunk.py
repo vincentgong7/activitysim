@@ -322,6 +322,70 @@ def _restore_rng_offsets(snapshot):
         )
 
 
+def run_with_memory_retry_by_group(
+    work_fn,
+    chooser_chunk,
+    state=None,
+    chunk_sizer=None,
+    group_col="chunk_id",
+    depth=0,
+    trace_label=None,
+    _workable=None,
+):
+    """Like ``run_with_memory_retry``, for loops that chunk by group rather than by row.
+
+    ``adaptive_chunked_choosers_by_chunk_id`` hands out every row whose ``chunk_id`` falls in
+    a range, because rows sharing an id -- all the persons of a household, say -- have to be
+    processed together. Halving on row position would cut such a group in two, so the range of
+    ids is halved instead and every group stays whole.
+
+    Falls back to re-raising when the chunk holds a single group: there is nothing left to
+    split, and processing half a household would be worse than failing.
+    """
+    top_level = _workable is None
+    if top_level:
+        _workable = []
+    rng_offsets = _rng_offsets(state, chooser_chunk)
+    failed = False
+    try:
+        with _cap_for_chunk_work(state, trace_label):
+            out = [work_fn(chooser_chunk)]
+        _workable.append(len(chooser_chunk))
+        return out
+    except MemoryError:
+        failed = True
+    assert failed
+    _restore_rng_offsets(rng_offsets)
+
+    ids = chooser_chunk[group_col]
+    lo, hi = int(ids.min()), int(ids.max())
+    if lo >= hi:
+        raise MemoryError(
+            f"{trace_label or 'chunk'}: a single {group_col} group of "
+            f"{len(chooser_chunk)} rows exceeds available memory and cannot be split"
+        )
+    _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
+
+    mid = lo + (hi - lo) // 2
+    out = []
+    for part in (chooser_chunk[ids <= mid], chooser_chunk[ids > mid]):
+        if len(part) == 0:
+            continue
+        out += run_with_memory_retry_by_group(
+            work_fn,
+            part,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            group_col=group_col,
+            depth=depth + 1,
+            trace_label=trace_label,
+            _workable=_workable,
+        )
+    if top_level:
+        _report_split(chunk_sizer, len(chooser_chunk), _workable, trace_label)
+    return out
+
+
 def _report_split(chunk_sizer, proposed_rows, workable, trace_label):
     """Tell the chunk sizer what actually fit, so it stops proposing what did not."""
     if chunk_sizer is None or not workable:
