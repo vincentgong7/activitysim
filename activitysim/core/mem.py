@@ -465,6 +465,31 @@ def growth_memory_cap(divisor: int = 1) -> int:
     return own + allowance
 
 
+def step_memory_cap(state, step_name: str = None):
+    """The loose, per-model-step ceiling — a diagnostic rather than a guarantee.
+
+    Undivided by worker count on purpose. Everything a step does outside a chunk loop --
+    building the chooser table, joining it to the sampled alternatives, concatenating the
+    chunked results -- has no smaller form to retry, so a cap sized to one worker's share
+    can only convert work that would have completed into a failure. Measured against the
+    whole of what is available, normal work never notices it.
+
+    What it does catch is one step trying to take far more than the machine has. Today that
+    ends as a container kill: every log stops in the same second and nothing records which
+    worker or which model was responsible. Under this ceiling the same event raises where it
+    happened, with a traceback naming the step and the size of the allocation. The run still
+    fails; it fails with an explanation.
+
+    It cannot prevent every kill. Several workers each taking a little too much still add up
+    past the limit, because each of them measures the same available memory. That case needs
+    the divided cap, which is armed around chunked work where a failure can be absorbed.
+    """
+    settings = getattr(state, "settings", None) if state is not None else None
+    if not getattr(settings, "memory_fail_recovery", False):
+        return contextlib.nullcontext()
+    return memory_cap(divisor=1, trace_label=step_name)
+
+
 @contextlib.contextmanager
 def memory_cap(divisor: int = 1, trace_label: str = None):
     """Cap this process's anonymous memory for the duration of the block, then restore it.

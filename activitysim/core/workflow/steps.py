@@ -364,7 +364,17 @@ class step:
                         kwargs.pop(arg)
             try:
                 state.this_step = self
-                outcome = error_logging(wrapped_func)(state, *args, **kwargs)
+                from activitysim.core import mem
+
+                # A loose ceiling for the whole step, when memory_fail_recovery is on. It is
+                # deliberately undivided: work outside a chunk loop cannot be split and
+                # retried, so a share-sized cap there only turns allocations that would have
+                # succeeded into failures. This one is wide enough to leave normal work alone
+                # and still catch a single runaway before the kernel does -- the difference
+                # between a container killed with every log ending in the same second, and an
+                # exception naming the step that did it.
+                with mem.step_memory_cap(state, self._step_name):
+                    outcome = error_logging(wrapped_func)(state, *args, **kwargs)
             finally:
                 del state.this_step
             if self._kind == "table":
