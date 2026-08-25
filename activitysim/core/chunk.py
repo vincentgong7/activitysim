@@ -255,6 +255,7 @@ def run_with_memory_retry(
     if top_level:
         _workable = []
     rng_offsets = _rng_offsets(state, chooser_chunk)
+    stack_depths = _chunk_stack_depths(state)
     failed = False
     try:
         with _cap_for_chunk_work(state, trace_label):
@@ -265,6 +266,7 @@ def run_with_memory_retry(
         failed = True
     assert failed
     _restore_rng_offsets(rng_offsets)
+    _restore_chunk_stacks(state, stack_depths, trace_label)
     _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
     mid = len(chooser_chunk) // 2
     out = []
@@ -346,6 +348,7 @@ def run_with_memory_retry_by_group(
     if top_level:
         _workable = []
     rng_offsets = _rng_offsets(state, chooser_chunk)
+    stack_depths = _chunk_stack_depths(state)
     failed = False
     try:
         with _cap_for_chunk_work(state, trace_label):
@@ -356,6 +359,7 @@ def run_with_memory_retry_by_group(
         failed = True
     assert failed
     _restore_rng_offsets(rng_offsets)
+    _restore_chunk_stacks(state, stack_depths, trace_label)
 
     ids = chooser_chunk[group_col]
     lo, hi = int(ids.min()), int(ids.max())
@@ -397,6 +401,34 @@ def _report_split(chunk_sizer, proposed_rows, workable, trace_label):
         logger.warning(
             f"{trace_label or 'chunk'}: could not report the memory split to the chunk "
             "sizer; later chunks may have to be halved again"
+        )
+
+
+def _chunk_stack_depths(state):
+    """How deep ActivitySim's chunk bookkeeping is right now, or None."""
+    try:
+        return len(state.chunk.CHUNK_SIZERS), len(state.chunk.CHUNK_LEDGERS)
+    except Exception:
+        return None
+
+
+def _restore_chunk_stacks(state, depths, trace_label):
+    """Unwind any chunk bookkeeping the failed attempt left behind.
+
+    A retry has to start from the state the failed attempt started from. Anything that pushed
+    a sizer or a ledger and did not get to pop it leaves the two stacks at different depths,
+    and the next nested chunker asserts on exactly that.
+    """
+    if depths is None:
+        return
+    try:
+        sizers, ledgers = depths
+        del state.chunk.CHUNK_SIZERS[sizers:]
+        del state.chunk.CHUNK_LEDGERS[ledgers:]
+    except Exception:
+        logger.warning(
+            f"{trace_label or 'chunk'}: could not unwind chunk bookkeeping after a "
+            "MemoryError; the retry may trip an internal consistency check"
         )
 
 
@@ -446,6 +478,7 @@ def run_with_memory_retry_alts(
     if top_level:
         _workable = []
     rng_offsets = _rng_offsets(state, chooser_chunk)
+    stack_depths = _chunk_stack_depths(state)
     failed = False
     try:
         with _cap_for_chunk_work(state, trace_label):
@@ -456,6 +489,7 @@ def run_with_memory_retry_alts(
         failed = True
     assert failed
     _restore_rng_offsets(rng_offsets)
+    _restore_chunk_stacks(state, stack_depths, trace_label)
     _reclaim_or_give_up(len(chooser_chunk), depth, trace_label)
     mid = len(chooser_chunk) // 2
     out = []
@@ -1792,13 +1826,19 @@ def chunk_log(state: workflow.State, trace_label, chunk_tag=None, base=False):
 
     chunk_sizer.initial_rows_per_chunk()
 
-    with chunk_sizer.ledger():
-        yield chunk_sizer
+    try:
+        with chunk_sizer.ledger():
+            yield chunk_sizer
 
-        if _chunk_training_mode != MODE_CHUNKLESS:
-            chunk_sizer.adaptive_rows_per_chunk(1)
-
-    chunk_sizer.close()
+            if _chunk_training_mode != MODE_CHUNKLESS:
+                chunk_sizer.adaptive_rows_per_chunk(1)
+    finally:
+        # close() pops CHUNK_SIZERS; ledger() pops CHUNK_LEDGERS in its own finally. Leaving
+        # this outside a finally meant an exception passing through popped one stack and not
+        # the other, and the next nested chunker then tripped the assertion that the two are
+        # the same depth. It never showed while an exception here meant the run was over
+        # anyway; it surfaces the moment a MemoryError becomes something to recover from.
+        chunk_sizer.close()
 
 
 @contextmanager

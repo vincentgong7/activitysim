@@ -537,6 +537,36 @@ def test_group_split_reraises_on_a_single_group():
         chunk.run_with_memory_retry_by_group(always_fails, data, trace_label="t")
 
 
+def test_chunk_bookkeeping_is_unwound_before_a_retry(state):
+    # ActivitySim asserts that its sizer and ledger stacks stay the same depth. Work that
+    # fails part-way can leave one of them pushed, and the retry would then start from a state
+    # the first attempt never saw -- and trip that assertion.
+    data = pd.DataFrame({"x": range(40)})
+    depths = []
+
+    def work(chunk_df):
+        depths.append((len(state.chunk.CHUNK_SIZERS), len(state.chunk.CHUNK_LEDGERS)))
+        if len(chunk_df) > 20:
+            state.chunk.CHUNK_SIZERS.append("leaked by the failed attempt")
+            raise MemoryError("too big")
+        return len(chunk_df)
+
+    out = chunk.run_with_memory_retry(work, data, state=state, trace_label="t")
+
+    assert sum(out) == 40
+    # every attempt saw the same bookkeeping depth the first one did
+    assert len(set(depths)) == 1, depths
+
+
+def test_chunk_log_pops_its_sizer_even_when_the_body_raises(state):
+    before = len(state.chunk.CHUNK_SIZERS)
+    with pytest.raises(RuntimeError):
+        with chunk.chunk_log(state, "t"):
+            raise RuntimeError("boom")
+    assert len(state.chunk.CHUNK_SIZERS) == before
+    assert len(state.chunk.CHUNK_SIZERS) == len(state.chunk.CHUNK_LEDGERS)
+
+
 def test_retry_without_state_still_runs():
     # state is optional: callers whose work draws no random numbers need not supply it
     persons = _persons(4)
