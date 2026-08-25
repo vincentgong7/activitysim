@@ -1151,7 +1151,11 @@ def interaction_sample(
             )
 
         for choices in chunk.run_with_memory_retry(
-            _work, chooser_chunk, state=state, trace_label=chunk_trace_label
+            _work,
+            chooser_chunk,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            trace_label=chunk_trace_label,
         ):
             if choices.shape[0] > 0:
                 # might not be any if allow_zero_probs

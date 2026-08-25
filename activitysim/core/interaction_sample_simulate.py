@@ -647,6 +647,7 @@ def interaction_sample_simulate(
             chooser_chunk,
             alternative_chunk,
             state=state,
+            chunk_sizer=chunk_sizer,
             trace_label=chunk_trace_label,
         ):
             result_list.append(choices)

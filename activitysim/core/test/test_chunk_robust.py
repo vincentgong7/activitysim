@@ -395,6 +395,82 @@ def test_retry_reproduces_draws_when_the_failed_attempt_already_drew():
     npt.assert_array_equal(reference, retried)
 
 
+class _FakeSizer:
+    """Just the bookkeeping the retry touches."""
+
+    def __init__(self, cum_rows):
+        self.cum_rows = cum_rows
+        self.max_workable_rows = None
+        self.trace_label = "t"
+
+    note_memory_failure = chunk.ChunkSizer.note_memory_failure
+
+
+def test_split_chunk_is_reported_to_the_sizer():
+    # the sizer measures per-row cost as peak memory over the rows it believes produced that
+    # peak. A split chunk breaks that: the peak belongs to one piece, the row count to the
+    # whole chunk. Uncorrected, the cost reads low and the NEXT chunk is sized LARGER -- the
+    # retry would feed the growth it exists to contain.
+    data = pd.DataFrame({"x": range(100)})
+    sizer = _FakeSizer(cum_rows=100)
+
+    def work(chunk_df):
+        if len(chunk_df) > 25:
+            raise MemoryError("too big")
+        return len(chunk_df)
+
+    out = chunk.run_with_memory_retry(work, data, chunk_sizer=sizer, trace_label="t")
+
+    assert sum(out) == 100  # all rows still processed
+    # 25 rows produced the peak, not 100, so the other 75 must not be charged against it
+    assert sizer.cum_rows == 25
+    # and the size that worked is remembered for later chunks
+    assert sizer.max_workable_rows == 25
+
+
+def test_unsplit_chunk_leaves_the_sizer_alone():
+    data = pd.DataFrame({"x": range(100)})
+    sizer = _FakeSizer(cum_rows=100)
+
+    chunk.run_with_memory_retry(lambda df: len(df), data, chunk_sizer=sizer)
+
+    assert sizer.cum_rows == 100  # nothing was split, nothing to correct
+    assert sizer.max_workable_rows is None
+
+
+def test_sizer_holds_later_chunks_at_the_workable_size():
+    # once recovery has established a workable size, the sizer must not propose more --
+    # the budget and the per-process memory cap are different limits and only recovery sees
+    # the second one
+    sizer = _FakeSizer(cum_rows=1000)
+    sizer.note_memory_failure(proposed_rows=800, workable_rows=100)
+    assert sizer.max_workable_rows == 100
+    # a later, smaller finding tightens it further; a larger one does not loosen it
+    sizer.note_memory_failure(proposed_rows=100, workable_rows=50)
+    assert sizer.max_workable_rows == 50
+    sizer.note_memory_failure(proposed_rows=400, workable_rows=200)
+    assert sizer.max_workable_rows == 50
+
+
+def test_reporting_failure_never_breaks_the_run():
+    # bookkeeping must not be able to take down the work it is protecting
+    class _Broken:
+        def note_memory_failure(self, *a, **k):
+            raise RuntimeError("sizer is unhappy")
+
+    data = pd.DataFrame({"x": range(40)})
+
+    def work(chunk_df):
+        if len(chunk_df) > 20:
+            raise MemoryError("too big")
+        return len(chunk_df)
+
+    out = chunk.run_with_memory_retry(
+        work, data, chunk_sizer=_Broken(), trace_label="t"
+    )
+    assert sum(out) == 40
+
+
 def test_retry_without_state_still_runs():
     # state is optional: callers whose work draws no random numbers need not supply it
     persons = _persons(4)

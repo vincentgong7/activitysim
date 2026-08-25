@@ -302,7 +302,11 @@ def compute_accessibility(
 
         accessibilities_list.extend(
             chunk.run_with_memory_retry(
-                _work, chooser_chunk, state=state, trace_label=trace_label
+                _work,
+                chooser_chunk,
+                state=state,
+                chunk_sizer=chunk_sizer,
+                trace_label=trace_label,
             )
         )
 

@@ -173,7 +173,13 @@ MEMORY_RETRY_MAX_DEPTH = 3
 
 
 def run_with_memory_retry(
-    work_fn, chooser_chunk, state=None, depth=0, trace_label=None
+    work_fn,
+    chooser_chunk,
+    state=None,
+    chunk_sizer=None,
+    depth=0,
+    trace_label=None,
+    _workable=None,
 ):
     """Run ``work_fn(chooser_chunk)``; on MemoryError, halve the chunk and retry.
 
@@ -204,10 +210,15 @@ def run_with_memory_retry(
     useful there without any cap. When the halving depth is exhausted the error re-raises —
     behavior then degrades to today's clean failure, never anything worse.
     """
+    top_level = _workable is None
+    if top_level:
+        _workable = []
     rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
-        return [work_fn(chooser_chunk)]
+        out = [work_fn(chooser_chunk)]
+        _workable.append(len(chooser_chunk))
+        return out
     except MemoryError:
         failed = True
     assert failed
@@ -217,8 +228,16 @@ def run_with_memory_retry(
     out = []
     for part in (chooser_chunk.iloc[:mid], chooser_chunk.iloc[mid:]):
         out += run_with_memory_retry(
-            work_fn, part, state=state, depth=depth + 1, trace_label=trace_label
+            work_fn,
+            part,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            depth=depth + 1,
+            trace_label=trace_label,
+            _workable=_workable,
         )
+    if top_level:
+        _report_split(chunk_sizer, len(chooser_chunk), _workable, trace_label)
     return out
 
 
@@ -261,6 +280,20 @@ def _restore_rng_offsets(snapshot):
         )
 
 
+def _report_split(chunk_sizer, proposed_rows, workable, trace_label):
+    """Tell the chunk sizer what actually fit, so it stops proposing what did not."""
+    if chunk_sizer is None or not workable:
+        return
+    try:
+        chunk_sizer.note_memory_failure(proposed_rows, max(workable))
+    except Exception:
+        # bookkeeping must never break the work it is protecting
+        logger.warning(
+            f"{trace_label or 'chunk'}: could not report the memory split to the chunk "
+            "sizer; later chunks may have to be halved again"
+        )
+
+
 def _reclaim_or_give_up(num_rows, depth, trace_label):
     """Reclaim a failed attempt and decide whether another halving is allowed.
 
@@ -282,7 +315,14 @@ def _reclaim_or_give_up(num_rows, depth, trace_label):
 
 
 def run_with_memory_retry_alts(
-    work_fn, chooser_chunk, alt_chunk, state=None, depth=0, trace_label=None
+    work_fn,
+    chooser_chunk,
+    alt_chunk,
+    state=None,
+    chunk_sizer=None,
+    depth=0,
+    trace_label=None,
+    _workable=None,
 ):
     """Like ``run_with_memory_retry``, for work that consumes choosers AND their alternatives.
 
@@ -296,10 +336,15 @@ def run_with_memory_retry_alts(
     ``state`` serves the same purpose as in ``run_with_memory_retry``: it lets a failed
     attempt's random draws be rewound so the retry reproduces an unfailed run.
     """
+    top_level = _workable is None
+    if top_level:
+        _workable = []
     rng_offsets = _rng_offsets(state, chooser_chunk)
     failed = False
     try:
-        return [work_fn(chooser_chunk, alt_chunk)]
+        out = [work_fn(chooser_chunk, alt_chunk)]
+        _workable.append(len(chooser_chunk))
+        return out
     except MemoryError:
         failed = True
     assert failed
@@ -313,9 +358,13 @@ def run_with_memory_retry_alts(
             part,
             alt_chunk[alt_chunk.index.isin(part.index)],
             state=state,
+            chunk_sizer=chunk_sizer,
             depth=depth + 1,
             trace_label=trace_label,
+            _workable=_workable,
         )
+    if top_level:
+        _report_split(chunk_sizer, len(chooser_chunk), _workable, trace_label)
     return out
 
 
@@ -1053,6 +1102,8 @@ class ChunkSizer:
         self.chunk_ledger = None
         self.history = {}
         self.cum_rows = 0
+        # largest chunk that memory-fail recovery found workable here, if any
+        self.max_workable_rows = None
         self.cum_overhead = {m: 0 for m in METRICS}
         self.headroom = None
 
@@ -1265,6 +1316,36 @@ class ChunkSizer:
 
         return rows_per_chunk, estimated_number_of_chunks
 
+    def note_memory_failure(self, proposed_rows: int, workable_rows: int) -> None:
+        """Report that ``proposed_rows`` would not fit but ``workable_rows`` did.
+
+        Two things need correcting, and the first is easy to miss. The per-row cost is
+        measured as this chunk's peak memory divided by the rows believed to have produced
+        it. When recovery splits a chunk, the peak belongs to one surviving piece while the
+        row count is still the whole chunk, so the cost comes out too low by roughly the
+        split factor -- and since rows = budget / cost, the NEXT chunk is then sized even
+        larger. Recovery would be feeding the very growth it is trying to contain. Charging
+        only the rows that actually produced the peak keeps the ratio honest.
+
+        The second is the point of reporting at all: remember the size that worked, so later
+        chunks of this component start from it instead of rediscovering the limit through
+        another round of halving.
+        """
+        proposed_rows = int(proposed_rows)
+        workable_rows = max(1, int(workable_rows))
+        if workable_rows >= proposed_rows:
+            return
+
+        self.cum_rows = max(1, self.cum_rows - (proposed_rows - workable_rows))
+
+        if self.max_workable_rows is None or workable_rows < self.max_workable_rows:
+            self.max_workable_rows = workable_rows
+
+        logger.warning(
+            f"{self.trace_label}: memory-fail recovery split a {proposed_rows}-row chunk; "
+            f"{workable_rows} rows fit. Sizing later chunks from that."
+        )
+
     def adaptive_rows_per_chunk(self, i):
         if self.chunk_training_mode == MODE_EXPLICIT:
             if self.rows_per_chunk:
@@ -1371,6 +1452,18 @@ class ChunkSizer:
                         f"backing off next chunk {self.rows_per_chunk} -> {backed_off} rows"
                     )
                     self.rows_per_chunk = backed_off
+
+        if self.max_workable_rows and self.rows_per_chunk > self.max_workable_rows:
+            # memory-fail recovery already established that a chunk this big does not fit
+            # here, whatever the budget arithmetic says. The budget and the per-process
+            # memory cap are different constraints and only recovery observes the second
+            # one, so without this the sizer would keep proposing chunks that have to be
+            # halved all over again.
+            logger.debug(
+                f"{self.trace_label}: holding next chunk at the size recovery found "
+                f"workable, {self.rows_per_chunk} -> {self.max_workable_rows} rows"
+            )
+            self.rows_per_chunk = self.max_workable_rows
 
         self.rows_per_chunk = np.clip(self.rows_per_chunk, 1, rows_remaining)
         self.rows_processed += self.rows_per_chunk
