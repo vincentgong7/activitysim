@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import glob
 import logging
@@ -170,6 +171,25 @@ def log_chunking_settings(state: workflow.State) -> None:
 
 # bounded halving depth for run_with_memory_retry (each level halves the chunk rows)
 MEMORY_RETRY_MAX_DEPTH = 3
+
+
+def _recovery_enabled(state) -> bool:
+    return bool(getattr(state.settings, "memory_fail_recovery", False))
+
+
+def _worker_count(state) -> int:
+    """The per-step worker count, as resolve_chunk_size reads it.
+
+    ``state.settings.num_processes`` is 0 when the count is auto-derived, so a worker reading
+    it would divide by 1 and claim the whole allowance for itself.
+    """
+    if not getattr(state.settings, "multiprocess", False):
+        return 1
+    try:
+        injected = state.get_injectable("num_processes", None)
+    except Exception:
+        injected = None
+    return int(injected or getattr(state.settings, "num_processes", 1) or 1)
 
 
 def run_with_memory_retry(
@@ -1568,7 +1588,15 @@ class ChunkSizer:
             log_rss(
                 self.state, self.trace_label, force=True
             )  # make sure we get at least one reading
-            yield
+            # One chunk's work is exactly the scope memory-fail recovery can rescue, so the
+            # cap is armed here and lifted again on the way out. Work outside this block --
+            # the joins and concatenations that build and consume the chunked results -- runs
+            # under whatever cap the caller had, because a cap there could only make an
+            # allocation fail that has no smaller form to retry.
+            with mem.memory_cap(
+                divisor=_worker_count(self.state), trace_label=self.trace_label
+            ) if _recovery_enabled(self.state) else contextlib.nullcontext():
+                yield
             log_rss(
                 self.state, self.trace_label, force=True
             )  # make sure we get at least one reading

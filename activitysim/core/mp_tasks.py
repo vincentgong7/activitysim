@@ -1108,11 +1108,6 @@ def mp_run_simulation(
 
     state = setup_injectables_and_logging(injectables, locutor=locutor)
 
-    if getattr(state.settings, "memory_fail_recovery", False):
-        cap = mem.worker_memory_cap(step_info.get("num_processes", 1))
-        if cap:
-            mem.set_process_memory_limit(cap)
-
     debug(
         state,
         f"mp_run_simulation {step_info['name']} locutor={state.get_injectable('locutor', False)} ",

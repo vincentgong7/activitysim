@@ -2,6 +2,7 @@
 # See full license in LICENSE.txt.
 from __future__ import annotations
 
+import contextlib
 import datetime
 import gc
 import glob
@@ -396,31 +397,29 @@ def get_peak_rss() -> int:
     return int(maxrss) * 1024 if sys.platform.startswith("linux") else int(maxrss)
 
 
-# Fraction of the memory still AVAILABLE that all workers together may hold as anonymous
-# memory when memory_fail_recovery is enabled: each worker's cap is
-# WORKER_MEMORY_CAP_RATIO * available / num_processes.
+# Fraction of the memory still AVAILABLE that a scope is allowed to grow into when
+# memory_fail_recovery is enabled. The remainder is left as slack for everything the process
+# does not account for.
 #
-# Available, not the whole limit. RLIMIT_DATA meters only anonymous memory, so everything
-# already charged to the cgroup when the workers start — shared skim buffers in /dev/shm,
-# the parent's own footprint, page cache — sits outside every worker's cap while still
-# counting toward the limit the kernel enforces. Sizing the caps against the raw limit
-# would let N * cap plus that resident floor exceed the limit, and the container would be
-# group-killed before any worker ever reached its cap: an insurance ceiling that cannot pay
-# out. On a Rotterdam-scale run the floor is dominated by ~38 GB of shared skims, so this
-# is the difference between the mechanism working and doing nothing at all.
+# A cap is armed for the scope where it can do something useful and lifted again on the way
+# out, rather than set once for the life of the worker. Two scopes matter:
 #
-# This still does NOT couple the ceiling to the per-component chunk budget — it shares only
-# the same reading of what memory exists, which is an input to both. If the budget
-# calculation is ever wrong, the ceiling still holds.
+#   * inside a chunk loop the allowance is divided by the worker count, because every worker
+#     is doing chunked work at the same time and they share one ceiling. Keeping each
+#     worker's growth inside its share is what makes a failure small enough for the chunk
+#     retry to absorb.
+#   * outside one, the allowance is not divided. Work there cannot be split and retried, so a
+#     cap that binds it can only turn a working run into a failing one -- which is exactly
+#     what a lifetime cap did on a Rotterdam-scale run: a 3.75M-row join failed for want of
+#     1.29 GB while 15 GB of the container sat unused. An undivided allowance still catches
+#     the case worth catching, a single outsized allocation, and turns what is otherwise a
+#     silent container kill into an exception naming the step that caused it.
 WORKER_MEMORY_CAP_RATIO = 0.9
 
-# A cap must leave a worker meaningfully more room than it already occupies; one at or below
-# its current footprint makes the first allocation fail and every halved retry fail with it
-# (observed directly: a cap under the baseline working set turns recovery into a guaranteed
-# clean failure). Below this multiple of the worker's own data segment we decline to set a
-# cap at all and say so, rather than arm a ceiling that can only misfire. A sanity floor,
-# not a tuned value.
-WORKER_MEMORY_CAP_MIN_HEADROOM = 2.0
+# Arming a cap that leaves almost no room makes the next allocation fail whatever its size,
+# and no amount of halving recovers from that. Below this much growth we decline to arm and
+# say so, rather than guarantee a failure.
+MIN_CAP_ALLOWANCE = 256 * 1024 * 1024
 
 
 def _own_data_segment() -> int | None:
@@ -435,32 +434,71 @@ def _own_data_segment() -> int | None:
     return None
 
 
-def worker_memory_cap(num_processes: int) -> int:
-    """The per-worker anonymous-memory cap for memory_fail_recovery, in bytes.
+def growth_memory_cap(divisor: int = 1) -> int:
+    """A total-memory cap that lets this process grow by a share of what is still available.
 
-    ``cap = WORKER_MEMORY_CAP_RATIO * available / num_processes``, where available is what
-    is left under the ceiling once the resident floor is accounted for — see the note on
-    WORKER_MEMORY_CAP_RATIO for why this is measured against available rather than the whole
-    limit. Memory-mapped skims are exempt from the cap by nature (RLIMIT_DATA does not count
-    file-backed mappings), so they need no separate allowance.
+    ``RLIMIT_DATA`` bounds a process's TOTAL anonymous memory, not its growth, so a cap of
+    "a share of what is available" would put a process that already holds more than that over
+    the line the moment it is armed: every later allocation fails, and halving cannot help
+    because what is already held is data the work needs. The cap is therefore measured from
+    what the process holds right now, so it expresses how much MORE it may use.
 
-    Returns 0 when no cap should be set: the available memory cannot be determined, or the
-    share works out too small to be usable.
+    That costs the container nothing, because memory already held is already counted in the
+    container's current usage: N workers each growing by ratio*available/N sums to
+    ratio*available on top of a usage that is already there.
+
+    Returns 0 when no cap should be armed — no reading available, or too little room left for
+    a cap to be anything but a guaranteed failure.
     """
-    available = get_available_memory()
-    if not available:
-        return 0
-    cap = int(WORKER_MEMORY_CAP_RATIO * available / max(int(num_processes), 1))
     own = _own_data_segment()
-    if own and cap < own * WORKER_MEMORY_CAP_MIN_HEADROOM:
+    available = get_available_memory()
+    if own is None or not available:
+        return 0
+    allowance = int(WORKER_MEMORY_CAP_RATIO * available / max(int(divisor), 1))
+    if allowance < MIN_CAP_ALLOWANCE:
         logger.warning(
-            f"memory_fail_recovery: not capping this worker — a share of "
-            f"{util.GB(cap)} leaves too little over its current {util.GB(own)} to work in. "
-            "Recovery is disabled for this process; consider fewer workers or a larger "
-            "memory limit."
+            f"memory_fail_recovery: not arming a cap — only {util.GB(allowance)} of growth "
+            f"would be allowed, which would fail immediately. Consider fewer workers or a "
+            f"larger memory limit."
         )
         return 0
-    return cap
+    return own + allowance
+
+
+@contextlib.contextmanager
+def memory_cap(divisor: int = 1, trace_label: str = None):
+    """Cap this process's anonymous memory for the duration of the block, then restore it.
+
+    Restores the PREVIOUS soft limit rather than removing the cap, so a tighter cap nested
+    inside a looser one leaves the looser one in force on the way out. Recomputed on every
+    entry: usage and availability move over a run, and a value computed once at startup is
+    stale by the time it is needed.
+
+    Never raises on account of the cap itself — if the limit cannot be read or applied the
+    block simply runs uncapped.
+    """
+    nbytes = growth_memory_cap(divisor)
+    previous = None
+    hard = None
+    if nbytes and resource is not None and hasattr(resource, "RLIMIT_DATA"):
+        try:
+            previous, hard = resource.getrlimit(resource.RLIMIT_DATA)
+            resource.setrlimit(resource.RLIMIT_DATA, (nbytes, hard))
+            logger.debug(
+                f"{trace_label or 'scope'}: memory cap armed at {util.GB(nbytes)} "
+                f"(1/{divisor} of available)"
+            )
+        except (ValueError, OSError) as e:
+            logger.warning(f"could not arm memory cap: {e}")
+            previous = None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            try:
+                resource.setrlimit(resource.RLIMIT_DATA, (previous, hard))
+            except (ValueError, OSError) as e:
+                logger.warning(f"could not restore the previous memory cap: {e}")
 
 
 def set_process_memory_limit(nbytes: int) -> bool:
