@@ -1374,6 +1374,7 @@ def run_cdap(
 
     cdap_results = hh_choice_results = None
     result_list = []
+    hh_choice_list = []
     # segment by person type and pick the right spec for each person type
     for (
         i,
@@ -1381,10 +1382,13 @@ def run_cdap(
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers_by_chunk_id(state, persons, trace_label):
-        if add_joint_tour_utility:
-            cdap_results, hh_choice_results = _run_cdap(
+
+        def _work(chunk_df):
+            # normalise the two shapes _run_cdap can return, so the retry has one thing to
+            # hand back however this is configured
+            out = _run_cdap(
                 state,
-                persons_chunk,
+                chunk_df,
                 person_type_map,
                 cdap_indiv_spec,
                 cdap_interaction_coefficients,
@@ -1396,25 +1400,22 @@ def run_cdap(
                 chunk_sizer=chunk_sizer,
                 compute_settings=compute_settings,
             )
-        else:
-            cdap_results = _run_cdap(
-                state,
-                persons_chunk,
-                person_type_map,
-                cdap_indiv_spec,
-                cdap_interaction_coefficients,
-                cdap_fixed_relative_proportions,
-                locals_d,
-                trace_hh_id,
-                chunk_trace_label,
-                add_joint_tour_utility,
-                chunk_sizer=chunk_sizer,
-                compute_settings=compute_settings,
-            )
+            return out if add_joint_tour_utility else (out, None)
 
-        result_list.append(cdap_results)
+        # chunked by chunk_id: a household's people are one unit of work, so the split has to
+        # fall on a group boundary
+        for cdap_results, hh_choice_results in chunk.run_with_memory_retry_by_group(
+            _work,
+            persons_chunk,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            trace_label=chunk_trace_label,
+        ):
+            result_list.append(cdap_results)
+            if hh_choice_results is not None:
+                hh_choice_list.append(hh_choice_results)
 
-        chunk_sizer.log_df(trace_label, "result_list", result_list)
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
     # FIXME: this will require 2X RAM
     # if necessary, could append to hdf5 store on disk:
@@ -1428,6 +1429,14 @@ def run_cdap(
             label="cdap",
             columns=["cdap_rank", "cdap_activity"],
             warn_if_empty=True,
+        )
+
+    # hh_choice_results is one row per household, so it has to be gathered across chunks the
+    # same way cdap_results is. Assigning it per chunk kept only the last chunk's households,
+    # which went unnoticed because it is only produced when add_joint_tour_utility is set.
+    if hh_choice_list:
+        hh_choice_results = (
+            hh_choice_list[0] if len(hh_choice_list) == 1 else pd.concat(hh_choice_list)
         )
 
     # return choices column as series

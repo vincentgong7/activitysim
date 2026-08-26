@@ -486,33 +486,47 @@ def apply_stage_two_model(
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers_by_chunk_id(state, side_trips, trace_label):
-        for is_outbound, trip_segment in chooser_chunk.groupby(OUTBOUND):
-            direction = OUTBOUND if is_outbound else "inbound"
-            spec = get_spec_for_segment(omnibus_spec, direction)
-            segment_trace_label = f"{direction}_{chunk_trace_label}"
 
-            patterns = build_patterns(trip_segment, time_windows)
+        def _work(chunk_df):
+            # both directions of a chunk are done together, so the retry gets one list back
+            # rather than being entered twice for the same rows
+            out = []
+            for is_outbound, trip_segment in chunk_df.groupby(OUTBOUND):
+                direction = OUTBOUND if is_outbound else "inbound"
+                spec = get_spec_for_segment(omnibus_spec, direction)
+                segment_trace_label = f"{direction}_{chunk_trace_label}"
 
-            choices = choose_tour_leg_pattern(
-                state,
-                trip_segment,
-                patterns,
-                spec,
-                trace_label=segment_trace_label,
-                chunk_sizer=chunk_sizer,
-                model_settings=model_settings,
-            )
+                patterns = build_patterns(trip_segment, time_windows)
 
-            choices = pd.merge(
-                choices.reset_index(),
-                patterns.reset_index(),
-                on=[TOUR_LEG_ID, PATTERN_ID],
-                how="left",
-            )
+                choices = choose_tour_leg_pattern(
+                    state,
+                    trip_segment,
+                    patterns,
+                    spec,
+                    trace_label=segment_trace_label,
+                    chunk_sizer=chunk_sizer,
+                    model_settings=model_settings,
+                )
 
-            choices = choices[["trip_id", "stop_time_duration"]].copy()
+                choices = pd.merge(
+                    choices.reset_index(),
+                    patterns.reset_index(),
+                    on=[TOUR_LEG_ID, PATTERN_ID],
+                    how="left",
+                )
 
-            trip_list.append(choices)
+                out.append(choices[["trip_id", "stop_time_duration"]].copy())
+            return out
+
+        # chunked by chunk_id, so the split falls on a group boundary
+        for segment_choices in chunk.run_with_memory_retry_by_group(
+            _work,
+            chooser_chunk,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            trace_label=chunk_trace_label,
+        ):
+            trip_list.extend(segment_choices)
 
     trip_list = pd.concat(trip_list, sort=True).set_index("trip_id")
     trips["stop_time_duration"] = 0

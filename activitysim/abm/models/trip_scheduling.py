@@ -573,6 +573,7 @@ def trip_scheduling(
     assert max_iterations > 0
 
     choices_list = []
+    iterations_used = []
 
     for (
         chunk_i,
@@ -582,53 +583,79 @@ def trip_scheduling(
     ) in chunk.adaptive_chunked_choosers_by_chunk_id(
         state, trips_df, trace_label, trace_label
     ):
-        i = 0
-        while (i < max_iterations) and not trips_chunk.empty:
-            # only chunk log first iteration since memory use declines with each iteration
-            with (
-                chunk.chunk_log(state, trace_label)
-                if i == 0
-                else chunk.chunk_log_skip()
-            ):
-                i += 1
-                is_last_iteration = i == max_iterations
 
-                trace_label_i = tracing.extend_trace_label(trace_label, "i%s" % i)
-                logger.info(
-                    "%s scheduling %s trips within chunk %s",
-                    trace_label_i,
-                    trips_chunk.shape[0],
-                    chunk_i,
-                )
+        def _work(chunk_df):
+            """One chunk's whole iteration sequence, so a retry restarts something complete.
 
-                choices = run_trip_scheduling(
-                    state,
-                    trips_chunk,
-                    tours,
-                    probs_spec,
-                    model_settings,
-                    estimator=estimator,
-                    is_last_iteration=is_last_iteration,
-                    trace_label=trace_label_i,
-                    chunk_sizer=chunk_sizer,
-                )
+            The passes are not independent -- each one narrows the chunk to the trips the
+            previous could not schedule, and the last behaves differently -- so a retry that
+            resumed mid-sequence would be resuming a state that never existed for the halved
+            chunk. Re-running the sequence repeats scheduling that had succeeded, which is
+            the price of the unit being coherent.
+            """
+            remaining = chunk_df
+            local_choices = []
+            n = 0
+            while (n < max_iterations) and not remaining.empty:
+                # only chunk log first iteration since memory use declines with each iteration
+                with (
+                    chunk.chunk_log(state, trace_label)
+                    if n == 0
+                    else chunk.chunk_log_skip()
+                ):
+                    n += 1
+                    is_last_iteration = n == max_iterations
 
-                # boolean series of trips whose individual trip scheduling failed
-                failed = choices.reindex(trips_chunk.index).isnull()
-                logger.info("%s %s failed", trace_label_i, failed.sum())
-
-                if (failed.sum() > 0) & (model_settings.scheduling_mode == "relative"):
-                    raise InvalidTravelError(
-                        "failed trips with relative scheduling mode"
+                    trace_label_i = tracing.extend_trace_label(trace_label, "i%s" % n)
+                    logger.info(
+                        "%s scheduling %s trips within chunk %s",
+                        trace_label_i,
+                        remaining.shape[0],
+                        chunk_i,
                     )
 
-                if not is_last_iteration:
-                    # boolean series of trips whose leg scheduling failed
-                    failed_cohorts = failed_trip_cohorts(trips_chunk, failed)
-                    trips_chunk = trips_chunk[failed_cohorts]
-                    choices = choices[~failed_cohorts]
+                    choices = run_trip_scheduling(
+                        state,
+                        remaining,
+                        tours,
+                        probs_spec,
+                        model_settings,
+                        estimator=estimator,
+                        is_last_iteration=is_last_iteration,
+                        trace_label=trace_label_i,
+                        chunk_sizer=chunk_sizer,
+                    )
 
-                choices_list.append(choices)
+                    # boolean series of trips whose individual trip scheduling failed
+                    failed = choices.reindex(remaining.index).isnull()
+                    logger.info("%s %s failed", trace_label_i, failed.sum())
+
+                    if (failed.sum() > 0) & (
+                        model_settings.scheduling_mode == "relative"
+                    ):
+                        raise InvalidTravelError(
+                            "failed trips with relative scheduling mode"
+                        )
+
+                    if not is_last_iteration:
+                        # boolean series of trips whose leg scheduling failed
+                        failed_cohorts = failed_trip_cohorts(remaining, failed)
+                        remaining = remaining[failed_cohorts]
+                        choices = choices[~failed_cohorts]
+
+                    local_choices.append(choices)
+            iterations_used.append(n)
+            return local_choices
+
+        # chunked by chunk_id, so the split falls on a group boundary
+        for chunk_choices in chunk.run_with_memory_retry_by_group(
+            _work,
+            trips_chunk,
+            state=state,
+            chunk_sizer=chunk_sizer,
+            trace_label=chunk_trace_label,
+        ):
+            choices_list.extend(chunk_choices)
 
     trips_df = trips.copy()
 
@@ -641,6 +668,7 @@ def trip_scheduling(
 
     choices = pd.concat(choices_list)
     choices = choices.reindex(trips_df.index)
+    i = max(iterations_used) if iterations_used else 0
 
     if estimator:
         estimator.write_choices(choices)
