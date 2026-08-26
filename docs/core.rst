@@ -686,6 +686,41 @@ is unchanged. Settings:
 * chunk_peak_backoff_ratio: 0.9 - fraction of the per-worker budget a chunk's incremental peak may reach before the next chunk is halved
 
 
+Recoverable out-of-memory (``memory_fail_recovery``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Chunk sizing is a prediction, and inside a container a wrong prediction is fatal rather than slow:
+the kernel kills every process in the cgroup at once, so nothing survives to report which model was
+responsible. Setting ``memory_fail_recovery: true`` (Linux only, default off) turns that into a
+recoverable event.
+
+* Two ``RLIMIT_DATA`` soft caps are armed and lifted as the run proceeds, each measured from what
+  the process already holds, so that the cap expresses how much *more* it may use.
+  ``RLIMIT_DATA`` bounds a total, so a cap set to a bare share of what is available would put a
+  process already holding more than that over the line the moment it is armed.
+* Around one chunk's work the allowance is ``0.9 * available / num_processes``. An allocation over
+  it raises a catchable ``MemoryError``, and ``chunk.run_with_memory_retry`` halves the chunk and
+  runs it again, to a bounded depth; on exhaustion the error re-raises.
+* Around a whole model step the allowance is ``memory_step_cap_ratio`` of what is available,
+  undivided, defaulting to all of it. At that default the ceiling coincides with the container
+  limit, so it cannot refuse an allocation that would have fitted, while still converting a kill
+  into an exception naming the step. Work outside a chunk loop cannot be split, so a ceiling that
+  binds it could only turn success into failure.
+* Memory-mapped skims are exempt by nature — ``RLIMIT_DATA`` covers anonymous memory only, not
+  file-backed mappings — so they need no allowance. On platforms without ``RLIMIT_DATA`` the caps
+  are a no-op, and the retry works there against the allocator's own refusal.
+* A retried chunk reproduces an unretried run: draws are seeded per row index, and a retry rewinds
+  the stream position of the rows it re-runs. The chunk sizer is also told the size that fitted,
+  which keeps its per-row cost estimate honest across a split and stops later chunks from
+  rediscovering the same limit.
+* Loops that chunk by ``chunk_id`` use ``chunk.run_with_memory_retry_by_group``, which halves the
+  range of ids rather than the rows, so rows that must be processed together stay together.
+
+Settings:
+
+* memory_fail_recovery: False - arm the caps and enable chunk retries (Linux only; a no-op elsewhere)
+* memory_step_cap_ratio: 1.0 - fraction of still-available memory a whole model step may grow into; at 1.0 the ceiling is the container limit and can only catch allocations that were going to fail regardless
+
 API
 ^^^
 

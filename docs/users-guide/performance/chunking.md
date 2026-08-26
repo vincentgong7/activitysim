@@ -69,3 +69,50 @@ details on whether explicit chunking is available with that component.)  The
 chunk setting can be set to an integer number of choosers to process in each
 chunk, or to a fractional value to make chunks approximately that fraction of
 the overall number of chooser (e.g. set to 0.25 to get four chunks).
+
+## Recovering From Running Out of Memory
+
+Every chunking strategy on this page is a prediction, and each of them has the same
+weakness: the prediction has to be right the first time, because being wrong ends the
+run.  Inside a container that ending is abrupt.  The kernel kills every process in the
+cgroup together, so nothing gets the chance to report what happened — the parent never
+sees a worker die, and every log stops in the same second without recording which model
+was responsible.
+
+Setting `memory_fail_recovery: true` (Linux only, off by default) changes that.  Each
+worker caps its own anonymous memory just below what the container can give it, so an
+over-large allocation raises a catchable `MemoryError` in the worker that asked for it
+rather than pushing the container over its limit.  The chunk loop then halves that chunk
+and runs it again, and tells the chunk sizer what size did fit so later chunks start
+from there.
+
+The intent is not to make a badly-sized run fast.  It is to stop a badly-sized run from
+being fatal:
+
+* where the memory is being used *inside* a chunk loop, a wrong chunk size costs a
+  retry rather than the run;
+* where it is being used *outside* one — building a chooser table, joining sampled
+  alternatives, writing summaries — nothing can be split, so the run still fails, but it
+  fails with a traceback naming the step and the allocation instead of vanishing.
+
+Two properties are worth knowing before enabling it.
+
+**Results do not change.** Each row's random draws are seeded from its own index, so
+splitting a chunk is invisible to the random streams, and a retry rewinds the stream
+position of the rows it re-runs.  A run that hits retries produces the same choices as
+one that does not.
+
+**It is not a licence to under-provision.** A cap cannot conjure memory that is not
+there.  If the ceiling is below what a component needs before it even reaches chunked
+work, the run fails immediately — cleanly and legibly, but immediately.  Relaxing
+`chunk_size_safety_factor` because retries will catch the overruns is also a poor trade:
+it buys little time and spends most of the headroom that keeps a run away from the
+ceiling.
+
+Two settings control it:
+
+* `memory_fail_recovery` — off by default; the whole mechanism.
+* `memory_step_cap_ratio` — the fraction of still-available memory a whole model step
+  may grow into, default `1.0`.  At the default this ceiling sits at the container limit,
+  where it can only catch allocations that were going to fail anyway.  Lower it to be
+  told sooner, at the risk of stopping a step short of memory it could have used.

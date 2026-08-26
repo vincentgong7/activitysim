@@ -14,6 +14,55 @@ branch (i.e., the main branch on GitHub), but not yet released in a stable versi
 of ActivitySim.  See below under the various version headings for changes in
 released versions.
 
+### Recovering from Out-of-Memory Instead of Dying (`memory_fail_recovery`)
+
+A new optional setting `memory_fail_recovery` (default `False`, Linux only) makes a
+chunk that runs out of memory a recoverable event rather than a fatal one.
+
+When a containerised run exceeds its cgroup limit, the kernel kills every process in
+the container at once.  There is no opportunity to react: the parent never observes a
+worker dying, `fail_fast` is never reached, and every log ends in the same second with
+nothing recording which model was responsible.  Sampling cannot prevent it either —
+single allocations of several GB are atomic and cannot be interrupted from Python.
+
+With the setting enabled, two `RLIMIT_DATA` soft caps are armed and lifted as the run
+proceeds, each measured from what the process already holds so that it expresses how
+much *more* it may use:
+
+* around one chunk's work, a share of the available memory divided by the worker
+  count.  An allocation over it raises a catchable `MemoryError` in that worker, and
+  the chunk loop halves the chunk and runs it again.  Bounded depth; when the depth is
+  exhausted the error re-raises, so behaviour degrades to today's clean failure and
+  never to anything worse.
+* around a whole model step, `memory_step_cap_ratio` of what is available, undivided
+  and defaulting to all of it.  At that default the ceiling coincides with the
+  container limit, so it can never refuse an allocation that would have fitted, while
+  still converting a kill into an exception that names the step responsible.  Work
+  outside a chunk loop — building a chooser table, joining sampled alternatives,
+  writing summaries — cannot be split and retried, so a ceiling that binds it could
+  only turn success into failure.
+
+Memory-mapped skims are unaffected: `RLIMIT_DATA` covers anonymous memory only, and
+file-backed mappings are exempt.  On platforms without `RLIMIT_DATA` (Windows) the
+caps are a no-op, because that allocator already refuses over-commitment at allocation
+time with a `MemoryError`; the retry then works there without any cap.
+
+A retried chunk reproduces an unretried run.  Each row's random draws are seeded from
+its own index, so splitting a chunk is invisible to the random streams, and a retry
+rewinds the stream position of the rows it re-runs — otherwise results would silently
+depend on whether a `MemoryError` happened to occur.  The chunk sizer is told the size
+that did fit, both so its per-row cost estimate stays honest across a split and so
+later chunks start from that size instead of rediscovering the limit.
+
+All fourteen chunk loops in the ABM and core route their work through the retry.
+Loops that chunk by `chunk_id` split on group boundaries, so the rows that must be
+processed together — all the persons of a household — stay together.
+
+Measured on a full-population run (1.2M households, 8.1M trips, six workers, 60 GiB):
+leaving the setting on costs about 1% of runtime and changes no choice, and a
+configuration that was previously OOM-killed after 11 minutes completes in 190,
+absorbing 408 memory failures on the way.
+
 ### Automatic Chunk Sizing from the Real Memory Limit (`chunk_size_mode: auto`)
 
 A new optional setting `chunk_size_mode` controls where adaptive chunking's memory
