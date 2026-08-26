@@ -434,7 +434,7 @@ def _own_data_segment() -> int | None:
     return None
 
 
-def growth_memory_cap(divisor: int = 1) -> int:
+def growth_memory_cap(divisor: int = 1, ratio: float = None) -> int:
     """A total-memory cap that lets this process grow by a share of what is still available.
 
     ``RLIMIT_DATA`` bounds a process's TOTAL anonymous memory, not its growth, so a cap of
@@ -454,7 +454,9 @@ def growth_memory_cap(divisor: int = 1) -> int:
     available = get_available_memory()
     if own is None or not available:
         return 0
-    allowance = int(WORKER_MEMORY_CAP_RATIO * available / max(int(divisor), 1))
+    if ratio is None:
+        ratio = WORKER_MEMORY_CAP_RATIO
+    allowance = int(ratio * available / max(int(divisor), 1))
     if allowance < MIN_CAP_ALLOWANCE:
         logger.warning(
             f"memory_fail_recovery: not arming a cap — only {util.GB(allowance)} of growth "
@@ -463,6 +465,24 @@ def growth_memory_cap(divisor: int = 1) -> int:
         )
         return 0
     return own + allowance
+
+
+# What fraction of the still-available memory a whole model step may grow into. Unlike the
+# per-chunk cap this is NOT divided by worker count, and it defaults to all of it.
+#
+# A ceiling meant for diagnosis must be a fixed line, not one that closes in. Sizing it as a
+# fraction of what remains has the opposite property: the less memory is left, the tighter it
+# gets -- so it binds hardest late in a run, when memory is naturally scarce and the work is
+# no less legitimate. A full-population run died exactly that way: the step that writes the
+# data dictionary needs nearly all the remaining memory to load the trips table, and a 0.9
+# ceiling refused a 2 GB allocation that had completed without a cap.
+#
+# At 1.0 the ceiling coincides with the container limit. It can then never refuse an
+# allocation that would have fitted -- anything above it was going to be killed by the kernel
+# anyway -- while still converting that kill into an exception that names the step. Lower it
+# only to be told sooner, accepting that the step may be stopped short of what it could have
+# used.
+STEP_MEMORY_CAP_RATIO = 1.0
 
 
 def step_memory_cap(state, step_name: str = None):
@@ -487,11 +507,12 @@ def step_memory_cap(state, step_name: str = None):
     settings = getattr(state, "settings", None) if state is not None else None
     if not getattr(settings, "memory_fail_recovery", False):
         return contextlib.nullcontext()
-    return memory_cap(divisor=1, trace_label=step_name)
+    ratio = getattr(settings, "memory_step_cap_ratio", None) or STEP_MEMORY_CAP_RATIO
+    return memory_cap(divisor=1, ratio=ratio, trace_label=step_name)
 
 
 @contextlib.contextmanager
-def memory_cap(divisor: int = 1, trace_label: str = None):
+def memory_cap(divisor: int = 1, ratio: float = None, trace_label: str = None):
     """Cap this process's anonymous memory for the duration of the block, then restore it.
 
     Restores the PREVIOUS soft limit rather than removing the cap, so a tighter cap nested
@@ -502,7 +523,7 @@ def memory_cap(divisor: int = 1, trace_label: str = None):
     Never raises on account of the cap itself — if the limit cannot be read or applied the
     block simply runs uncapped.
     """
-    nbytes = growth_memory_cap(divisor)
+    nbytes = growth_memory_cap(divisor, ratio)
     previous = None
     hard = None
     if nbytes and resource is not None and hasattr(resource, "RLIMIT_DATA"):

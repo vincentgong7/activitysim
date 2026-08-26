@@ -446,16 +446,43 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
 
     memory_fail_recovery: bool = False
     """
-    Convert a worker's fatal out-of-memory into a recoverable error (Linux only).
+    Convert a fatal out-of-memory into a recoverable error (Linux only).
 
-    When enabled, each multiprocess worker caps its own anonymous memory at
-    ``0.9 * memory_limit / num_processes`` (``RLIMIT_DATA`` soft limit). An allocation that
-    would exceed the cap raises a catchable ``MemoryError`` inside that worker instead of
-    growing the container to its cgroup limit, where the kernel kills every process in the
-    container as a group. Components integrated with ``chunk.run_with_memory_retry`` then
-    retry the failing chunk in halves. Memory-mapped skims are unaffected (file-backed
-    mappings are exempt from the cap). No effect on platforms without ``RLIMIT_DATA``
-    (Windows), whose allocators already fail over-large allocations with ``MemoryError``.
+    When enabled, two ``RLIMIT_DATA`` soft caps are armed and lifted as the run proceeds,
+    each measured from what the process already holds so that it expresses how much MORE may
+    be used:
+
+    * around one chunk's work, a share of what is available divided by the worker count.
+      Every worker is doing chunked work at once and they share one ceiling, so keeping each
+      inside its share is what makes a failure small enough for the retry to absorb.
+      Components integrated with ``chunk.run_with_memory_retry`` then retry the failing chunk
+      in halves.
+    * around a whole model step, ``memory_step_cap_ratio`` of what is available, undivided --
+      see that setting.
+
+    An allocation over a cap raises a catchable ``MemoryError`` in the offending process
+    instead of growing the container to its cgroup limit, where the kernel kills every process
+    in the container as a group. Memory-mapped skims are unaffected (file-backed mappings are
+    exempt). No effect on platforms without ``RLIMIT_DATA`` (Windows), whose allocators
+    already fail over-large allocations with ``MemoryError``.
+    """
+
+    memory_step_cap_ratio: float = 1.0
+    """
+    Fraction of the still-available memory one model step may grow into, when
+    ``memory_fail_recovery`` is enabled.
+
+    At the default of 1.0 the ceiling coincides with the container limit, so it can never
+    refuse an allocation that would have fitted: anything above it was going to be killed by
+    the kernel anyway, and the cap converts that kill into an exception naming the step. This
+    matters because work outside a chunk loop -- building a chooser table, joining sampled
+    alternatives, writing summaries -- cannot be split and retried, so a ceiling that binds it
+    only turns success into failure.
+
+    Lower it to be told sooner, at the risk of stopping a step short of memory it could have
+    used. Beware that a fraction of what *remains* tightens as a run proceeds, so a value well
+    below 1.0 binds hardest late in a run, when memory is naturally scarce and the work is no
+    less legitimate.
     """
 
     chunk_peak_backoff_ratio: float = 0.9

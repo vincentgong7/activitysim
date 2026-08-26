@@ -205,6 +205,27 @@ def test_memory_cap_runs_uncapped_when_it_cannot_arm():
             pass  # must not raise
 
 
+def test_step_cap_defaults_to_the_whole_of_what_is_available():
+    # a diagnostic ceiling must be a fixed line, not one that closes in as memory runs low
+    import unittest.mock as um
+
+    from activitysim.core.configuration.top import Settings
+
+    assert Settings().memory_step_cap_ratio == 1.0
+
+    own, available = 10 * GIB, 19 * GIB
+    with um.patch.object(mem, "_own_data_segment", lambda: own), um.patch.object(
+        mem, "get_available_memory", lambda **kw: available
+    ):
+        at_default = mem.growth_memory_cap(divisor=1, ratio=1.0)
+        tightened = mem.growth_memory_cap(divisor=1, ratio=0.9)
+
+    # at 1.0 the step may grow into everything that is left -- i.e. up to the container limit
+    assert at_default == own + available
+    # anything less holds it short of memory the container would have given it
+    assert tightened < at_default
+
+
 def test_memory_fail_recovery_defaults_off():
     from activitysim.core.configuration.top import Settings
 
