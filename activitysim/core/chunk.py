@@ -943,6 +943,13 @@ class ChunkHistorian:
 
         history_df = pd.DataFrame.from_dict(history)
 
+        if history_df.empty:
+            # A sizer that never completed a chunk has nothing to record. This happens when
+            # the work raised before the first chunk finished; the columns below were never
+            # created, and selecting them would raise a KeyError that replaces the real
+            # exception on its way out.
+            return
+
         # just want the last, most up to date row
         history_df = history_df.tail(1)
 
@@ -1321,16 +1328,19 @@ class ChunkSizer:
         if self.chunk_training_mode in (MODE_CHUNKLESS, MODE_EXPLICIT):
             return
 
-        if ((self.depth == 1) or WRITE_SUBCHUNK_HISTORY) and (
-            self.chunk_training_mode
-            not in (MODE_PRODUCTION, MODE_CHUNKLESS, MODE_EXPLICIT)
-        ):
-            self.state.chunk.HISTORIAN.write_history(
-                self.state, self.history, self.chunk_tag
-            )
-
-        _chunk_sizer = self.state.chunk.CHUNK_SIZERS.pop()
-        assert _chunk_sizer == self
+        try:
+            if ((self.depth == 1) or WRITE_SUBCHUNK_HISTORY) and (
+                self.chunk_training_mode
+                not in (MODE_PRODUCTION, MODE_CHUNKLESS, MODE_EXPLICIT)
+            ):
+                self.state.chunk.HISTORIAN.write_history(
+                    self.state, self.history, self.chunk_tag
+                )
+        finally:
+            # popping is the reason close() is called from a finally at all, so it cannot be
+            # left to depend on the bookkeeping above succeeding
+            _chunk_sizer = self.state.chunk.CHUNK_SIZERS.pop()
+            assert _chunk_sizer == self
 
     def available_headroom(self, xss):
         headroom = self.base_chunk_size - xss

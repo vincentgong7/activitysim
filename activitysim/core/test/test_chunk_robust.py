@@ -558,6 +558,18 @@ def test_chunk_bookkeeping_is_unwound_before_a_retry(state):
     assert len(set(depths)) == 1, depths
 
 
+def test_a_failure_before_the_first_chunk_does_not_mask_itself(state):
+    # close() runs from a finally so the stacks stay balanced. If it then raises on its own --
+    # writing a history that was never populated -- it replaces the real exception on the way
+    # out and leaves the stack unpopped after all.
+    before = len(state.chunk.CHUNK_SIZERS)
+    with pytest.raises(ValueError, match="the real problem"):
+        with chunk.chunk_log(state, "t"):
+            raise ValueError("the real problem")
+    assert len(state.chunk.CHUNK_SIZERS) == before
+    assert len(state.chunk.CHUNK_SIZERS) == len(state.chunk.CHUNK_LEDGERS)
+
+
 def test_chunk_log_pops_its_sizer_even_when_the_body_raises(state):
     before = len(state.chunk.CHUNK_SIZERS)
     with pytest.raises(RuntimeError):
