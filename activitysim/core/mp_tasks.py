@@ -1970,8 +1970,37 @@ def get_run_list(state: workflow.State):
 
     # default settings that can be overridden by settings in individual steps
     global_chunk_size = state.settings.chunk_size
-    default_mp_processes = state.settings.num_processes or int(
-        1 + multiprocessing.cpu_count() / 2.0
+    # With chunk_size_mode: auto the chunk budget already comes from the real memory ceiling, so
+    # the worker count is the last thing in the settings that describes the hardware. Derive it
+    # from the same ceiling when it is not given: more workers than the memory can feed only
+    # starves each of them into thrashing, and the cpu-only heuristic cannot see that. An explicit
+    # num_processes always wins, the legacy fixed chunk mode is untouched, and anything we cannot
+    # measure falls back to the heuristic rather than to a guess.
+    auto_mp_processes = None
+    if (
+        not state.settings.num_processes
+        and getattr(state.settings, "chunk_size_mode", "fixed") == "auto"
+    ):
+        auto_mp_processes = mem.recommend_num_processes(
+            target_per_worker=(
+                getattr(state.settings, "worker_memory_target", 0)
+                or mem.DEFAULT_WORKER_MEMORY_TARGET
+            ),
+            safety=getattr(state.settings, "chunk_size_safety_factor", 0.5) or 0.5,
+        )
+        if auto_mp_processes:
+            target = (
+                getattr(state.settings, "worker_memory_target", 0)
+                or mem.DEFAULT_WORKER_MEMORY_TARGET
+            )
+            logger.info(
+                f"num_processes = {auto_mp_processes}, derived from available memory "
+                f"and {util.GB(target)} per worker (set num_processes to override)"
+            )
+    default_mp_processes = (
+        state.settings.num_processes
+        or auto_mp_processes
+        or int(1 + multiprocessing.cpu_count() / 2.0)
     )
 
     if multiprocess and multiprocessing.cpu_count() == 1:

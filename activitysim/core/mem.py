@@ -462,6 +462,111 @@ def get_available_memory(
         return limit
 
 
+# How much memory one multiprocess worker should have to itself when the worker count is left
+# to us. It is the number the recommendation divides by, so it answers "how much elbow room
+# does one worker need", not "how much memory does this machine have" -- unlike chunk_size it is
+# a property of the model and its data, not of the hardware, and it does not need recalibrating
+# when the run moves to a different machine.
+#
+# 3 GB comes from the only full-scale calibration we have: four full-population Rotterdam runs
+# (2.56M persons, 8.1M trips, 7026 zones) on a 60 GB container with 6 workers, where the derived
+# per-worker budget settled between 2.4 and 3.6 GB and every run completed. Treat it as a
+# defensible starting point, not a law -- it is one model at one scale. Getting it wrong costs
+# efficiency, never correctness: too small over-subscribes the machine and chunks thrash, too
+# large leaves cores idle. Override with the `worker_memory_target` setting.
+DEFAULT_WORKER_MEMORY_TARGET = 3 * 1024**3
+
+
+def get_cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """Whole CPUs this process may use, or None if there is no quota to read.
+
+    psutil reports the HOST's processors, which inside a container is not what the scheduler will
+    give us: a pod limited to 8 CPUs on a 16-core node still sees 16. Prefers the cgroup CPU quota
+    (v2 ``cpu.max`` = "<quota> <period>", or "max" for none; v1 ``cpu.cfs_quota_us`` with
+    ``cpu.cfs_period_us``, where -1 means none) and returns None when unlimited or unreadable, so
+    the caller falls back to the processor count.
+    """
+    raw = _read_cgroup_file(os.path.join(cgroup_root, "cpu.max"))
+    if raw:
+        parts = raw.split()
+        if parts and parts[0] != "max":
+            try:
+                quota = int(parts[0])
+                period = int(parts[1]) if len(parts) > 1 else 100000
+                if quota > 0 and period > 0:
+                    return max(1, int(quota // period))
+            except ValueError:
+                pass
+    quota_raw = _read_cgroup_file(os.path.join(cgroup_root, "cpu/cpu.cfs_quota_us"))
+    period_raw = _read_cgroup_file(os.path.join(cgroup_root, "cpu/cpu.cfs_period_us"))
+    if quota_raw and period_raw:
+        try:
+            quota, period = int(quota_raw), int(period_raw)
+            if quota > 0 and period > 0:
+                return max(1, int(quota // period))
+        except ValueError:
+            pass
+    return None
+
+
+def _usable_cpus(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """Cores worth putting a worker on: the cgroup quota if there is one, else physical cores.
+
+    Physical rather than logical: ActivitySim workers are compute-bound, and counting SMT siblings
+    as places to put one over-subscribes the machine. psutil returns None for the physical count on
+    some platforms, so fall back through the logical count to os.cpu_count().
+    """
+    limit = get_cpu_limit(cgroup_root)
+    if limit:
+        return limit
+    for count in (
+        lambda: psutil.cpu_count(logical=False),
+        lambda: psutil.cpu_count(),
+        os.cpu_count,
+    ):
+        try:
+            n = count()
+        except Exception:
+            n = None
+        if n:
+            return int(n)
+    return None
+
+
+def recommend_num_processes(
+    target_per_worker: int = DEFAULT_WORKER_MEMORY_TARGET,
+    safety: float = 1.0,
+    cgroup_root: str = "/sys/fs/cgroup",
+) -> int | None:
+    """How many workers this machine can actually feed, or None if it cannot be worked out.
+
+        N = clamp(available * safety // target_per_worker, 1, usable CPUs)
+
+    The counterpart of the chunk budget, solved for the other unknown: instead of being told the
+    worker count and dividing the memory by it, we are told what one worker needs and derive the
+    count. That is what removes the last machine-specific number from the configuration -- with
+    ``chunk_size_mode: auto`` supplying the budget, nothing left in the settings describes the
+    hardware.
+
+    Availability comes from get_available_memory, which already resolves the platform for us: the
+    cgroup working set inside a container, and psutil's available RAM outside one -- on Linux the
+    kernel's MemAvailable, on Windows AvailPhys, both of which already report memory obtainable
+    without going to disk. So this needs no per-platform branch of its own.
+
+    Meant to be called ONCE, in the parent, before any worker exists: what it measures then is the
+    headroom the workers are about to share. Returns None rather than a guess when the numbers are
+    unreadable, so the caller can keep its own default.
+    """
+    if not target_per_worker or target_per_worker <= 0:
+        return None
+    available = get_available_memory(cgroup_root, basis=BASIS_WORKING_SET)
+    cpus = _usable_cpus(cgroup_root)
+    if not available or not cpus:
+        return None
+    n = int((available * safety) // target_per_worker)
+    return max(1, min(n, int(cpus)))
+
+
 def get_peak_rss() -> int:
     """Exact lifetime peak RSS of this process in bytes, from the kernel (``getrusage`` ru_maxrss).
 

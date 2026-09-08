@@ -485,6 +485,33 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     less legitimate.
     """
 
+    worker_memory_target: int = 0
+    """
+    Memory one multiprocess worker should have to itself, in bytes, used to DERIVE
+    ``num_processes`` when it is not set.
+
+    Applies only when ``num_processes`` is left unset and ``chunk_size_mode: auto`` is on; an
+    explicit ``num_processes`` always wins, and with the legacy ``fixed`` chunk mode nothing
+    changes. The count is then::
+
+        num_processes = clamp(available * chunk_size_safety_factor // worker_memory_target,
+                              1, usable CPUs)
+
+    where availability is the container's working set inside a cgroup and the operating system's
+    available memory outside one, and usable CPUs is the cgroup CPU quota if there is one, else
+    the physical core count. Evaluated once in the parent process, before any worker exists.
+
+    ``0`` (the default) means use the built-in target of 3 GB, which is calibrated from
+    full-population runs rather than guessed -- see ``mem.DEFAULT_WORKER_MEMORY_TARGET``. Unlike
+    ``chunk_size`` this is not a hardware number: it says how much elbow room the model needs per
+    worker, and it does not have to be revisited when the run moves to a different machine.
+
+    Set it larger if workers are being starved into tiny chunks, smaller to use more cores on a
+    machine with memory to spare. Getting it wrong costs efficiency, not correctness. If the
+    memory or CPU figures cannot be read at all, the count falls back to ActivitySim's usual
+    ``1 + cpu_count/2``.
+    """
+
     chunk_peak_backoff_ratio: float = 0.9
     """
     Fraction of the per-worker budget a chunk's incremental memory peak may reach before the

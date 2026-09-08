@@ -175,6 +175,123 @@ def test_working_set_falls_back_when_the_cache_split_is_missing(tmp_path):
     )
 
 
+class _FakeVM:
+    def __init__(self, total, available):
+        self.total, self.available = total, available
+
+
+def _fake_psutil(monkeypatch, total, available, physical=None, logical=None):
+    """Stand in for psutil so a test can pose as a machine it is not running on."""
+
+    class _P:
+        @staticmethod
+        def virtual_memory():
+            return _FakeVM(total, available)
+
+        @staticmethod
+        def cpu_count(logical=True):  # noqa: A002 — psutil's own parameter name
+            return _P._logical if logical else _P._physical
+
+    _P._physical, _P._logical = physical, logical
+    monkeypatch.setattr(mem, "psutil", _P)
+    return _P
+
+
+def test_recommend_num_processes_in_a_container(tmp_path, monkeypatch):
+    """The container case: memory from the cgroup working set, cores from the cgroup quota."""
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(root, "memory.current", str(50 * GIB))          # mostly written-out cache
+    _write(
+        root,
+        "memory.stat",
+        "anon 6442450944\nshmem 1073741824\n"             # 6 + 1 GiB
+        "active_file 1073741824\ninactive_file 45097156608\n",
+    )
+    # 60 - 8 = 52 GiB available; x 0.5 = 26 GiB; / 3 GiB = 8 workers, under the 12-CPU quota
+    _write(root, "cpu.max", "1200000 100000")
+    assert mem.get_cpu_limit(cgroup_root=root) == 12
+    n = mem.recommend_num_processes(
+        target_per_worker=3 * GIB, safety=0.5, cgroup_root=root
+    )
+    assert n == 8
+
+
+def test_recommend_num_processes_is_clamped_by_the_cpu_quota(tmp_path):
+    """A pod with plenty of memory but few CPUs must not be told to run a worker per GB.
+
+    psutil would report the host's processors here, which is exactly the number a container must
+    not use.
+    """
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(
+        root,
+        "memory.stat",
+        "anon 2147483648\nshmem 0\nactive_file 0\ninactive_file 0\n",
+    )
+    _write(root, "cpu.max", "400000 100000")               # 4 CPUs
+    # memory alone would allow (60-2) * 0.5 / 3 = 9 workers
+    assert mem.recommend_num_processes(3 * GIB, 0.5, cgroup_root=root) == 4
+
+
+def test_recommend_num_processes_outside_a_container(tmp_path, monkeypatch):
+    """Bare metal, and Windows: no cgroup, so the OS's own available-memory figure decides.
+
+    On Linux that is MemAvailable and on Windows AvailPhys; both already report memory obtainable
+    without going to disk, so no per-platform branch is needed here. Physical cores bound it,
+    because workers are compute-bound and SMT siblings are not extra places to put one.
+    """
+    _fake_psutil(
+        monkeypatch, total=64 * GIB, available=32 * GIB, physical=8, logical=16
+    )
+    # no cgroup files under tmp_path -> the psutil path; 32 x 0.5 / 3 = 5 workers, under 8 cores
+    assert mem.recommend_num_processes(3 * GIB, 0.5, cgroup_root=str(tmp_path)) == 5
+
+
+def test_recommend_num_processes_on_a_small_machine(tmp_path, monkeypatch):
+    """A laptop with little free memory gets one worker, never zero."""
+    _fake_psutil(
+        monkeypatch, total=8 * GIB, available=2 * GIB, physical=4, logical=8
+    )
+    assert mem.recommend_num_processes(3 * GIB, 0.5, cgroup_root=str(tmp_path)) == 1
+
+
+def test_recommend_num_processes_without_a_physical_core_count(tmp_path, monkeypatch):
+    # psutil returns None for the physical count on some platforms -> fall back to logical
+    _fake_psutil(
+        monkeypatch, total=64 * GIB, available=64 * GIB, physical=None, logical=3
+    )
+    assert mem.recommend_num_processes(3 * GIB, 1.0, cgroup_root=str(tmp_path)) == 3
+
+
+def test_recommend_num_processes_declines_rather_than_guessing(tmp_path, monkeypatch):
+    """Unreadable machine -> None, so the caller keeps ActivitySim's own default."""
+
+    class _Broken:
+        @staticmethod
+        def virtual_memory():
+            raise RuntimeError("no")
+
+        @staticmethod
+        def cpu_count(logical=True):
+            return None
+
+    monkeypatch.setattr(mem, "psutil", _Broken)
+    monkeypatch.setattr(mem.os, "cpu_count", lambda: None)
+    assert mem.recommend_num_processes(3 * GIB, 0.5, cgroup_root=str(tmp_path)) is None
+    # and a nonsensical target is declined too, rather than dividing by zero
+    _fake_psutil(monkeypatch, total=64 * GIB, available=32 * GIB, physical=8, logical=8)
+    assert mem.recommend_num_processes(0, 0.5, cgroup_root=str(tmp_path)) is None
+
+
+def test_worker_memory_target_defaults_to_the_builtin(monkeypatch):
+    from activitysim.core.configuration.top import Settings
+
+    assert Settings().worker_memory_target == 0        # 0 means "use the built-in"
+    assert mem.DEFAULT_WORKER_MEMORY_TARGET == 3 * GIB
+
+
 def test_available_memory_fallback(tmp_path):
     # no usage file -> psutil available (a non-negative int)
     avail = mem.get_available_memory(cgroup_root=str(tmp_path))
