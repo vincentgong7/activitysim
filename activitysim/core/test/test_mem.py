@@ -69,6 +69,62 @@ def test_available_memory_cgroup(tmp_path):
     assert mem.get_available_memory(cgroup_root=root) == 30 * GIB
 
 
+def test_available_memory_can_ignore_reclaimable_page_cache(tmp_path):
+    """A container that looks full of page cache is not full.
+
+    A run mmaps its skims and writes tens of GB of output, so memory.current ends up dominated
+    by file-backed cache the kernel evicts on demand. Measured that way a 60 GB container looks
+    like it has 2 GB left while only 6 GB is genuinely unreclaimable. A ceiling sized on the
+    first number refuses work that would have fitted -- which is how a full-population run lost
+    write_data_dictionary to a 2 GB allocation while holding 0.77 GB.
+    """
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(root, "memory.current", str(58 * GIB))          # 52 GiB of it is page cache
+    _write(root, "memory.stat", "anon 5368709120\nfile 55834574848\nshmem 1073741824\n")
+
+    assert mem.get_nonreclaimable_used(cgroup_root=root) == 6 * GIB
+    assert mem.get_available_memory(cgroup_root=root) == 2 * GIB
+    assert mem.get_available_memory(cgroup_root=root, exclude_reclaimable=True) == 54 * GIB
+
+
+def test_nonreclaimable_falls_back_to_memory_current_when_unreadable(tmp_path):
+    # no memory.stat -> the caller must still get the old basis rather than nothing
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(root, "memory.current", str(58 * GIB))
+    assert mem.get_nonreclaimable_used(cgroup_root=root) is None
+    assert mem.get_available_memory(cgroup_root=root, exclude_reclaimable=True) == 2 * GIB
+
+
+def test_step_cap_measures_against_nonreclaimable_memory(monkeypatch):
+    """The step ceiling must not close in as page cache accumulates."""
+    seen = {}
+
+    def fake_available(cgroup_root="/sys/fs/cgroup", exclude_reclaimable=False):
+        seen["exclude_reclaimable"] = exclude_reclaimable
+        return 40 * GIB
+
+    monkeypatch.setattr(mem, "get_available_memory", fake_available)
+    monkeypatch.setattr(mem, "_own_data_segment", lambda: 2 * GIB)
+
+    class _S:
+        memory_fail_recovery = True
+        memory_step_cap_ratio = 1.0
+
+    class _State:
+        settings = _S()
+
+    with mem.step_memory_cap(_State(), "write_data_dictionary"):
+        pass
+    assert seen["exclude_reclaimable"] is True
+
+    # the per-chunk cap keeps the old, deliberately conservative basis
+    seen.clear()
+    mem.growth_memory_cap(divisor=6)
+    assert seen["exclude_reclaimable"] is False
+
+
 def test_available_memory_fallback(tmp_path):
     # no usage file -> psutil available (a non-negative int)
     avail = mem.get_available_memory(cgroup_root=str(tmp_path))

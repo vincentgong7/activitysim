@@ -340,7 +340,40 @@ def get_memory_limit(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
         return None
 
 
-def get_available_memory(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+def get_nonreclaimable_used(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """Bytes of NON-reclaimable memory charged to this cgroup, or None if unreadable.
+
+    = anonymous memory (private allocations) + pinned shared memory (tmpfs/shm). It excludes
+    file-backed page cache on purpose. A run memory-maps its skims from disk and writes tens of
+    GB of output, so most of ``memory.current`` is page cache the kernel evicts on demand.
+    Counting that as "used" makes the machine look full when it is not.
+
+    Reads cgroup v2 ``memory.stat`` (``anon`` + ``shmem``); falls back to the v1 field names.
+    """
+    fields = {}
+    for rel in ("memory.stat", "memory/memory.stat"):
+        raw = _read_cgroup_file(os.path.join(cgroup_root, rel))
+        if raw:
+            for line in raw.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        fields[parts[0]] = int(parts[1])
+                    except ValueError:
+                        pass
+            break
+    if not fields:
+        return None
+    anon = fields.get("anon", fields.get("rss"))
+    shmem = fields.get("shmem", 0)
+    if anon is None:
+        return None
+    return anon + shmem
+
+
+def get_available_memory(
+    cgroup_root: str = "/sys/fs/cgroup", exclude_reclaimable: bool = False
+) -> int | None:
     """Best-effort bytes still available before this process hits its ceiling.
 
     Uses (cgroup limit - cgroup current usage) when containerized, else psutil available RAM. Note
@@ -349,6 +382,11 @@ def get_available_memory(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
     """
     limit = get_memory_limit(cgroup_root)
     used = None
+    if exclude_reclaimable:
+        used = get_nonreclaimable_used(cgroup_root)
+        if limit is not None and used is not None:
+            return max(0, limit - used)
+        used = None            # unreadable -> fall through to the memory.current basis
     raw = _read_cgroup_file(os.path.join(cgroup_root, "memory.current"))
     if raw is not None:
         try:
@@ -434,7 +472,9 @@ def _own_data_segment() -> int | None:
     return None
 
 
-def growth_memory_cap(divisor: int = 1, ratio: float = None) -> int:
+def growth_memory_cap(
+    divisor: int = 1, ratio: float = None, exclude_reclaimable: bool = False
+) -> int:
     """A total-memory cap that lets this process grow by a share of what is still available.
 
     ``RLIMIT_DATA`` bounds a process's TOTAL anonymous memory, not its growth, so a cap of
@@ -451,7 +491,7 @@ def growth_memory_cap(divisor: int = 1, ratio: float = None) -> int:
     a cap to be anything but a guaranteed failure.
     """
     own = _own_data_segment()
-    available = get_available_memory()
+    available = get_available_memory(exclude_reclaimable=exclude_reclaimable)
     if own is None or not available:
         return 0
     if ratio is None:
@@ -477,11 +517,17 @@ def growth_memory_cap(divisor: int = 1, ratio: float = None) -> int:
 # data dictionary needs nearly all the remaining memory to load the trips table, and a 0.9
 # ceiling refused a 2 GB allocation that had completed without a cap.
 #
-# At 1.0 the ceiling coincides with the container limit. It can then never refuse an
-# allocation that would have fitted -- anything above it was going to be killed by the kernel
-# anyway -- while still converting that kill into an exception that names the step. Lower it
-# only to be told sooner, accepting that the step may be stopped short of what it could have
-# used.
+# At 1.0 the ceiling coincides with the container limit -- but ONLY if "available" means what
+# the kernel could actually give out. Sized as limit - memory.current it does not: memory.current
+# counts file-backed page cache as used, and a run that mmaps its skims and writes tens of GB of
+# output ends with most of the container's usage being cache the kernel would evict on demand.
+# A full-population run died exactly there a second time: write_data_dictionary was refused a
+# 2 GB allocation while the process held 0.77 GB inside a 60 GB container, because the ceiling
+# had been sized against a machine that only looked full. The step cap therefore measures
+# availability as limit - (anon + shmem) -- see get_nonreclaimable_used -- so at 1.0 it really
+# does coincide with the limit and can never refuse an allocation that would have fitted, while
+# still converting a genuine runaway into an exception that names the step. Lower it only to be
+# told sooner, accepting that the step may be stopped short of what it could have used.
 STEP_MEMORY_CAP_RATIO = 1.0
 
 
@@ -493,6 +539,11 @@ def step_memory_cap(state, step_name: str = None):
     chunked results -- has no smaller form to retry, so a cap sized to one worker's share
     can only convert work that would have completed into a failure. Measured against the
     whole of what is available, normal work never notices it.
+
+    Availability here EXCLUDES reclaimable page cache (get_nonreclaimable_used). A step-level
+    allocation competes with the kernel's page cache, which the kernel drops rather than fail
+    the allocation; sizing this ceiling against limit - memory.current instead makes it close
+    in as cache accumulates and refuse late, legitimate work.
 
     What it does catch is one step trying to take far more than the machine has. Today that
     ends as a container kill: every log stops in the same second and nothing records which
@@ -508,11 +559,18 @@ def step_memory_cap(state, step_name: str = None):
     if not getattr(settings, "memory_fail_recovery", False):
         return contextlib.nullcontext()
     ratio = getattr(settings, "memory_step_cap_ratio", None) or STEP_MEMORY_CAP_RATIO
-    return memory_cap(divisor=1, ratio=ratio, trace_label=step_name)
+    return memory_cap(
+        divisor=1, ratio=ratio, trace_label=step_name, exclude_reclaimable=True
+    )
 
 
 @contextlib.contextmanager
-def memory_cap(divisor: int = 1, ratio: float = None, trace_label: str = None):
+def memory_cap(
+    divisor: int = 1,
+    ratio: float = None,
+    trace_label: str = None,
+    exclude_reclaimable: bool = False,
+):
     """Cap this process's anonymous memory for the duration of the block, then restore it.
 
     Restores the PREVIOUS soft limit rather than removing the cap, so a tighter cap nested
@@ -523,7 +581,7 @@ def memory_cap(divisor: int = 1, ratio: float = None, trace_label: str = None):
     Never raises on account of the cap itself — if the limit cannot be read or applied the
     block simply runs uncapped.
     """
-    nbytes = growth_memory_cap(divisor, ratio)
+    nbytes = growth_memory_cap(divisor, ratio, exclude_reclaimable=exclude_reclaimable)
     previous = None
     hard = None
     if nbytes and resource is not None and hasattr(resource, "RLIMIT_DATA"):
