@@ -190,7 +190,11 @@ def _cap_for_chunk_work(state, trace_label):
         divisor = _worker_count(state)
     except Exception:
         divisor = 1
-    return mem.memory_cap(divisor=divisor, trace_label=trace_label)
+    # Same basis as resolve_chunk_size: a cap sized from a smaller number than the budget it
+    # guards would refuse chunks the sizer had just decided were affordable.
+    return mem.memory_cap(
+        divisor=divisor, trace_label=trace_label, basis=mem.BASIS_WORKING_SET
+    )
 
 
 def _worker_count(state) -> int:
@@ -627,13 +631,14 @@ def resolve_chunk_size(state: workflow.State) -> int:
         return state.settings.chunk_size
 
     safety = state.settings.chunk_size_safety_factor
-    # Base the budget on (limit − current usage). The shared skim set is memory-mapped from disk
-    # (reclaimable page cache), but the pages a chunk is actively reading are momentarily in-use, so the
-    # skim working set is a REAL transient cost that scales with chunk size. Counting currently-resident
-    # memory (which includes the resident skim cache) keeps the budget honest: it shrinks as more skim
-    # pages fault in, tracking the working set. `available == 0` legitimately means "no headroom" — only a
-    # None (couldn't read usage) falls back to the raw limit.
-    available = mem.get_available_memory()
+    # Base the budget on (limit − working set). The shared skim set is memory-mapped from disk, and the
+    # pages a chunk is actively reading are a REAL transient cost that scales with chunk size, so they
+    # must stay counted: they land on the kernel's ACTIVE file list, and the working-set basis keeps
+    # them. What that basis drops is the inactive file cache — output tables written once and never
+    # read again. Charging those to the budget made it shrink as the run wrote its results, which has
+    # nothing to do with the pressure chunking has to respect. `available == 0` legitimately means "no
+    # headroom" — only a None (couldn't read usage) falls back to the raw limit.
+    available = mem.get_available_memory(basis=mem.BASIS_WORKING_SET)
     if available is not None:
         basis = max(0, min(limit, available))
     else:

@@ -85,7 +85,10 @@ def test_available_memory_can_ignore_reclaimable_page_cache(tmp_path):
 
     assert mem.get_nonreclaimable_used(cgroup_root=root) == 6 * GIB
     assert mem.get_available_memory(cgroup_root=root) == 2 * GIB
-    assert mem.get_available_memory(cgroup_root=root, exclude_reclaimable=True) == 54 * GIB
+    assert (
+        mem.get_available_memory(cgroup_root=root, basis=mem.BASIS_NONRECLAIMABLE)
+        == 54 * GIB
+    )
 
 
 def test_nonreclaimable_falls_back_to_memory_current_when_unreadable(tmp_path):
@@ -94,15 +97,18 @@ def test_nonreclaimable_falls_back_to_memory_current_when_unreadable(tmp_path):
     _write(root, "memory.max", str(60 * GIB))
     _write(root, "memory.current", str(58 * GIB))
     assert mem.get_nonreclaimable_used(cgroup_root=root) is None
-    assert mem.get_available_memory(cgroup_root=root, exclude_reclaimable=True) == 2 * GIB
+    assert (
+        mem.get_available_memory(cgroup_root=root, basis=mem.BASIS_NONRECLAIMABLE)
+        == 2 * GIB
+    )
 
 
 def test_step_cap_measures_against_nonreclaimable_memory(monkeypatch):
     """The step ceiling must not close in as page cache accumulates."""
     seen = {}
 
-    def fake_available(cgroup_root="/sys/fs/cgroup", exclude_reclaimable=False):
-        seen["exclude_reclaimable"] = exclude_reclaimable
+    def fake_available(cgroup_root="/sys/fs/cgroup", basis=mem.BASIS_USAGE):
+        seen["basis"] = basis
         return 40 * GIB
 
     monkeypatch.setattr(mem, "get_available_memory", fake_available)
@@ -117,12 +123,56 @@ def test_step_cap_measures_against_nonreclaimable_memory(monkeypatch):
 
     with mem.step_memory_cap(_State(), "write_data_dictionary"):
         pass
-    assert seen["exclude_reclaimable"] is True
+    assert seen["basis"] == mem.BASIS_NONRECLAIMABLE
 
-    # the per-chunk cap keeps the old, deliberately conservative basis
+    # a bare growth cap still defaults to the legacy basis; callers opt in
     seen.clear()
     mem.growth_memory_cap(divisor=6)
-    assert seen["exclude_reclaimable"] is False
+    assert seen["basis"] == mem.BASIS_USAGE
+
+
+def test_working_set_keeps_active_cache_and_releases_written_pages(tmp_path):
+    """The two kinds of page cache a run accumulates must not be treated alike.
+
+    The mapped skims are read over and over, so their pages stay ACTIVE and are a real cost that
+    the next chunk will need again. The output tables are written once and never read; those pages
+    go INACTIVE and the kernel drops them on demand. memory.current charges for both, so the chunk
+    budget shrank as the run wrote its results — pressure that chunking cannot relieve and should
+    not respond to.
+    """
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(root, "memory.current", str(58 * GIB))
+    _write(
+        root,
+        "memory.stat",
+        "anon 5368709120\n"           # 5 GiB private
+        "shmem 1073741824\n"          # 1 GiB shm
+        "file 55834574848\n"          # 52 GiB of cache, split below
+        "active_file 4294967296\n"    # 4 GiB skim working set — must stay counted
+        "inactive_file 51539607552\n",  # 48 GiB written output — must be released
+    )
+    assert mem.get_working_set_used(cgroup_root=root) == 10 * GIB
+    assert mem.get_available_memory(cgroup_root=root) == 2 * GIB
+    assert (
+        mem.get_available_memory(cgroup_root=root, basis=mem.BASIS_WORKING_SET) == 50 * GIB
+    )
+    # strictly between the two extremes: it gives back less than nonreclaimable does
+    assert mem.get_available_memory(
+        cgroup_root=root, basis=mem.BASIS_WORKING_SET
+    ) < mem.get_available_memory(cgroup_root=root, basis=mem.BASIS_NONRECLAIMABLE)
+
+
+def test_working_set_falls_back_when_the_cache_split_is_missing(tmp_path):
+    # cgroup v1 without the active/inactive split -> caller must still get the legacy basis
+    root = str(tmp_path)
+    _write(root, "memory.max", str(60 * GIB))
+    _write(root, "memory.current", str(58 * GIB))
+    _write(root, "memory.stat", "anon 5368709120\nshmem 1073741824\n")
+    assert mem.get_working_set_used(cgroup_root=root) is None
+    assert (
+        mem.get_available_memory(cgroup_root=root, basis=mem.BASIS_WORKING_SET) == 2 * GIB
+    )
 
 
 def test_available_memory_fallback(tmp_path):

@@ -340,16 +340,8 @@ def get_memory_limit(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
         return None
 
 
-def get_nonreclaimable_used(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
-    """Bytes of NON-reclaimable memory charged to this cgroup, or None if unreadable.
-
-    = anonymous memory (private allocations) + pinned shared memory (tmpfs/shm). It excludes
-    file-backed page cache on purpose. A run memory-maps its skims from disk and writes tens of
-    GB of output, so most of ``memory.current`` is page cache the kernel evicts on demand.
-    Counting that as "used" makes the machine look full when it is not.
-
-    Reads cgroup v2 ``memory.stat`` (``anon`` + ``shmem``); falls back to the v1 field names.
-    """
+def _cgroup_memory_stat(cgroup_root: str = "/sys/fs/cgroup") -> dict:
+    """The cgroup's ``memory.stat`` as a dict of ints, empty if it cannot be read."""
     fields = {}
     for rel in ("memory.stat", "memory/memory.stat"):
         raw = _read_cgroup_file(os.path.join(cgroup_root, rel))
@@ -362,31 +354,91 @@ def get_nonreclaimable_used(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
                     except ValueError:
                         pass
             break
+    return fields
+
+
+def get_nonreclaimable_used(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """Bytes of NON-reclaimable memory charged to this cgroup, or None if unreadable.
+
+    = anonymous memory (private allocations) + pinned shared memory (tmpfs/shm). It excludes
+    ALL file-backed page cache. A run memory-maps its skims from disk and writes tens of GB of
+    output, so most of ``memory.current`` is cache the kernel evicts on demand; counting that
+    as "used" makes the machine look full when it is not.
+
+    Reads cgroup v2 ``memory.stat`` (``anon`` + ``shmem``); falls back to the v1 field names.
+    """
+    fields = _cgroup_memory_stat(cgroup_root)
     if not fields:
         return None
     anon = fields.get("anon", fields.get("rss"))
-    shmem = fields.get("shmem", 0)
     if anon is None:
         return None
-    return anon + shmem
+    return anon + fields.get("shmem", 0)
+
+
+def get_working_set_used(cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """Bytes this cgroup is using that new work would actually have to compete with, or None.
+
+    = non-reclaimable memory + ACTIVE file cache. The distinction matters because the two kinds
+    of page cache a run accumulates have nothing in common:
+
+    * the skims are memory-mapped and read over and over, so their resident pages stay on the
+      active list and are a real, recurring cost that grows with chunk size. Treating them as
+      free would size chunks against memory that the very next chunk needs back.
+    * the output tables are written once and never read. Those pages land on the inactive list
+      and the kernel drops them the moment anything else wants the memory. Treating them as
+      used makes the budget shrink as the run writes, which is unrelated to any pressure the
+      chunking has to respect.
+
+    ``memory.current`` cannot tell them apart and so gets both wrong at once. Reads ``anon``,
+    ``shmem`` and ``active_file`` from ``memory.stat``; returns None if the split is unavailable,
+    so callers can fall back rather than guess.
+    """
+    fields = _cgroup_memory_stat(cgroup_root)
+    if not fields:
+        return None
+    anon = fields.get("anon", fields.get("rss"))
+    active_file = fields.get("active_file", fields.get("total_active_file"))
+    if anon is None or active_file is None:
+        return None
+    return anon + fields.get("shmem", 0) + active_file
+
+
+# How "used" is measured when working out what is still available. See the two functions above;
+# "usage" is cgroup memory.current, which counts every page of cache as used.
+BASIS_USAGE = "usage"
+BASIS_NONRECLAIMABLE = "nonreclaimable"
+BASIS_WORKING_SET = "working_set"
 
 
 def get_available_memory(
-    cgroup_root: str = "/sys/fs/cgroup", exclude_reclaimable: bool = False
+    cgroup_root: str = "/sys/fs/cgroup", basis: str = BASIS_USAGE
 ) -> int | None:
     """Best-effort bytes still available before this process hits its ceiling.
 
-    Uses (cgroup limit - cgroup current usage) when containerized, else psutil available RAM. Note
-    cgroup ``memory.current`` counts reclaimable page cache as used, so this under-estimates the truly
-    available memory — which is the safe direction for chunk sizing (errs toward smaller chunks).
+    Inside a container this is the cgroup limit minus what the cgroup is using; outside one it is
+    psutil's available RAM, which on every supported platform already reports memory obtainable
+    without going to disk (on Linux it is the kernel's own ``MemAvailable``), so reclaimable cache
+    is handled there without any help from us. Only the cgroup path needs to choose:
+
+    * ``BASIS_USAGE`` — ``memory.current``. Every cached page counts as used. Legacy, and wrong in
+      both directions once a run does real I/O.
+    * ``BASIS_NONRECLAIMABLE`` — anon + shmem. The most permissive: nothing the kernel could
+      reclaim is held against the caller. For a ceiling that must never refuse work that fits.
+    * ``BASIS_WORKING_SET`` — anon + shmem + active file cache. Counts the pages a run keeps
+      touching (the mapped skims) and releases the ones it has merely written. For sizing work.
+
+    A basis that cannot be computed falls back to ``BASIS_USAGE`` rather than to nothing.
     """
     limit = get_memory_limit(cgroup_root)
     used = None
-    if exclude_reclaimable:
+    if basis == BASIS_NONRECLAIMABLE:
         used = get_nonreclaimable_used(cgroup_root)
-        if limit is not None and used is not None:
-            return max(0, limit - used)
-        used = None            # unreadable -> fall through to the memory.current basis
+    elif basis == BASIS_WORKING_SET:
+        used = get_working_set_used(cgroup_root)
+    if limit is not None and used is not None:
+        return max(0, limit - used)
+    used = None                # unreadable, or basis == usage -> the memory.current basis
     raw = _read_cgroup_file(os.path.join(cgroup_root, "memory.current"))
     if raw is not None:
         try:
@@ -473,7 +525,7 @@ def _own_data_segment() -> int | None:
 
 
 def growth_memory_cap(
-    divisor: int = 1, ratio: float = None, exclude_reclaimable: bool = False
+    divisor: int = 1, ratio: float = None, basis: str = BASIS_USAGE
 ) -> int:
     """A total-memory cap that lets this process grow by a share of what is still available.
 
@@ -491,7 +543,7 @@ def growth_memory_cap(
     a cap to be anything but a guaranteed failure.
     """
     own = _own_data_segment()
-    available = get_available_memory(exclude_reclaimable=exclude_reclaimable)
+    available = get_available_memory(basis=basis)
     if own is None or not available:
         return 0
     if ratio is None:
@@ -560,7 +612,7 @@ def step_memory_cap(state, step_name: str = None):
         return contextlib.nullcontext()
     ratio = getattr(settings, "memory_step_cap_ratio", None) or STEP_MEMORY_CAP_RATIO
     return memory_cap(
-        divisor=1, ratio=ratio, trace_label=step_name, exclude_reclaimable=True
+        divisor=1, ratio=ratio, trace_label=step_name, basis=BASIS_NONRECLAIMABLE
     )
 
 
@@ -569,7 +621,7 @@ def memory_cap(
     divisor: int = 1,
     ratio: float = None,
     trace_label: str = None,
-    exclude_reclaimable: bool = False,
+    basis: str = BASIS_USAGE,
 ):
     """Cap this process's anonymous memory for the duration of the block, then restore it.
 
@@ -581,7 +633,7 @@ def memory_cap(
     Never raises on account of the cap itself — if the limit cannot be read or applied the
     block simply runs uncapped.
     """
-    nbytes = growth_memory_cap(divisor, ratio, exclude_reclaimable=exclude_reclaimable)
+    nbytes = growth_memory_cap(divisor, ratio, basis=basis)
     previous = None
     hard = None
     if nbytes and resource is not None and hasattr(resource, "RLIMIT_DATA"):
