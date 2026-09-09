@@ -19,6 +19,11 @@ released versions.
 A new optional setting `memory_fail_recovery` (default `False`, Linux only) makes a
 chunk that runs out of memory a recoverable event rather than a fatal one.
 
+Left at its default the feature is inert: no cap is armed and no `MemoryError` is caught,
+so a run behaves exactly as it does without this change. That holds even where catching
+one would have rescued the run — an opt-in feature should not alter what happens to
+anybody who did not opt in, however welcome the alteration might have been.
+
 When a containerised run exceeds its cgroup limit, the kernel kills every process in
 the container at once.  There is no opportunity to react: the parent never observes a
 worker dying, `fail_fast` is never reached, and every log ends in the same second with

@@ -20,6 +20,18 @@ DATADIR = os.path.join(TESTDIR, "data")
 GIB = 1024**3
 
 
+def _on(**extra):
+    """Minimal state with recovery switched on.
+
+    The retry helpers do nothing without it -- see _recovery_enabled -- so a test that means
+    to exercise halving has to say so, exactly as a user would.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(settings=SimpleNamespace(memory_fail_recovery=True, **extra))
+
+
+
 @pytest.fixture
 def state() -> workflow.State:
     st = workflow.State()
@@ -41,6 +53,45 @@ def data():
 
 
 EXPECTED = pd.Series([1, 1, 1])
+
+
+def test_nothing_happens_when_recovery_is_off():
+    """The promise: opt out and the code is not there.
+
+    A MemoryError that would have ended the run must still end it. Catching it anyway would
+    change what happens to users who never asked for this feature -- an improvement they did
+    not choose is still a surprise, and it is the kind of thing that makes an opt-in flag
+    untrustworthy.
+    """
+    calls = []
+
+    def work(df):
+        calls.append(len(df))
+        raise MemoryError("as upstream would")
+
+    class _S:
+        memory_fail_recovery = False
+
+    class _State:
+        settings = _S()
+
+    df = pd.DataFrame({"x": range(100)})
+    with pytest.raises(MemoryError):
+        chunk.run_with_memory_retry(work, df, state=_State(), trace_label="t")
+    assert calls == [100], "the chunk must be attempted once and not halved"
+
+    # and with it on, the same failure is absorbed by halving
+    _S.memory_fail_recovery = True
+    survived = []
+
+    def work2(df):
+        if len(df) > 25:
+            raise MemoryError("too big")
+        survived.append(len(df))
+        return len(df)
+
+    out = chunk.run_with_memory_retry(work2, df, state=_State(), trace_label="t")
+    assert sum(survived) == 100 and len(out) == len(survived) > 1
 
 
 def test_resolve_chunk_size_fixed_is_legacy(state):
@@ -258,7 +309,7 @@ def test_run_with_memory_retry_splits_and_merges():
             raise MemoryError("too big")
         return chunk_df["x"].sum()
 
-    out = chunk.run_with_memory_retry(work, data, trace_label="t")
+    out = chunk.run_with_memory_retry(work, data, trace_label="t", state=_on())
     assert calls == [100, 50, 50]  # full attempt, then the two halves
     assert sum(out) == data["x"].sum()  # nothing lost, nothing duplicated
 
@@ -270,13 +321,13 @@ def test_run_with_memory_retry_exhaustion_reraises():
         raise MemoryError("always")
 
     with pytest.raises(MemoryError):
-        chunk.run_with_memory_retry(always_fails, data, trace_label="t")
+        chunk.run_with_memory_retry(always_fails, data, trace_label="t", state=_on())
 
 
 def test_run_with_memory_retry_success_passthrough():
     # no failure -> exactly one call, one result
     data = pd.DataFrame({"x": range(10)})
-    out = chunk.run_with_memory_retry(lambda df: len(df), data)
+    out = chunk.run_with_memory_retry(lambda df: len(df), data, state=_on())
     assert out == [10]
 
 
@@ -310,7 +361,7 @@ def test_run_with_memory_retry_alts_keeps_alts_with_their_choosers():
         assert set(alt_df.index) == set(chunk_df.index)
         return alt_df["a"].tolist()
 
-    out = chunk.run_with_memory_retry_alts(work, choosers, alts, trace_label="t")
+    out = chunk.run_with_memory_retry_alts(work, choosers, alts, trace_label="t", state=_on())
 
     assert chooser_counts == [8, 4, 4]  # full attempt, then the two halves
     # every alternative row appears exactly once, in the original order
@@ -321,7 +372,7 @@ def test_run_with_memory_retry_alts_success_passthrough():
     choosers, alts = _choosers_and_sampled_alts(6)
     out = chunk.run_with_memory_retry_alts(
         lambda df, alt_df: (len(df), len(alt_df)), choosers, alts
-    )
+    , state=_on())
     assert out == [(len(choosers), len(alts))]
 
 
@@ -336,7 +387,10 @@ def _rng_and_state(persons):
     rng.set_base_seed(0)
     rng.begin_step("test_step")
     rng.add_channel("persons", persons)
-    return rng, SimpleNamespace(get_rn_generator=lambda: rng)
+    return rng, SimpleNamespace(
+        get_rn_generator=lambda: rng,
+        settings=SimpleNamespace(memory_fail_recovery=True),
+    )
 
 
 def _persons(n=8):
@@ -419,7 +473,7 @@ def test_split_chunk_is_reported_to_the_sizer():
             raise MemoryError("too big")
         return len(chunk_df)
 
-    out = chunk.run_with_memory_retry(work, data, chunk_sizer=sizer, trace_label="t")
+    out = chunk.run_with_memory_retry(work, data, chunk_sizer=sizer, trace_label="t", state=_on())
 
     assert sum(out) == 100  # all rows still processed
     # 25 rows produced the peak, not 100, so the other 75 must not be charged against it
@@ -432,7 +486,7 @@ def test_unsplit_chunk_leaves_the_sizer_alone():
     data = pd.DataFrame({"x": range(100)})
     sizer = _FakeSizer(cum_rows=100)
 
-    chunk.run_with_memory_retry(lambda df: len(df), data, chunk_sizer=sizer)
+    chunk.run_with_memory_retry(lambda df: len(df), data, chunk_sizer=sizer, state=_on())
 
     assert sizer.cum_rows == 100  # nothing was split, nothing to correct
     assert sizer.max_workable_rows is None
@@ -467,7 +521,7 @@ def test_reporting_failure_never_breaks_the_run():
 
     out = chunk.run_with_memory_retry(
         work, data, chunk_sizer=_Broken(), trace_label="t"
-    )
+    , state=_on())
     assert sum(out) == 40
 
 
@@ -522,7 +576,7 @@ def test_group_split_never_cuts_a_group_in_half():
             raise MemoryError("too many groups")
         return len(chunk_df)
 
-    out = chunk.run_with_memory_retry_by_group(work, data, trace_label="t")
+    out = chunk.run_with_memory_retry_by_group(work, data, trace_label="t", state=_on())
     assert sum(out) == len(data)  # every row processed exactly once
 
 
@@ -534,13 +588,14 @@ def test_group_split_reraises_on_a_single_group():
         raise MemoryError("nope")
 
     with pytest.raises(MemoryError, match="cannot be split"):
-        chunk.run_with_memory_retry_by_group(always_fails, data, trace_label="t")
+        chunk.run_with_memory_retry_by_group(always_fails, data, trace_label="t", state=_on())
 
 
 def test_chunk_bookkeeping_is_unwound_before_a_retry(state):
     # ActivitySim asserts that its sizer and ledger stacks stay the same depth. Work that
     # fails part-way can leave one of them pushed, and the retry would then start from a state
     # the first attempt never saw -- and trip that assertion.
+    state.settings.memory_fail_recovery = True   # the retry is opt-in
     data = pd.DataFrame({"x": range(40)})
     depths = []
 
@@ -582,7 +637,7 @@ def test_chunk_log_pops_its_sizer_even_when_the_body_raises(state):
 def test_retry_without_state_still_runs():
     # state is optional: callers whose work draws no random numbers need not supply it
     persons = _persons(4)
-    out = chunk.run_with_memory_retry(lambda df: len(df), persons)
+    out = chunk.run_with_memory_retry(lambda df: len(df), persons, state=_on())
     assert out == [4]
 
 
@@ -593,4 +648,4 @@ def test_run_with_memory_retry_alts_exhaustion_reraises():
         raise MemoryError("always")
 
     with pytest.raises(MemoryError):
-        chunk.run_with_memory_retry_alts(always_fails, choosers, alts, trace_label="t")
+        chunk.run_with_memory_retry_alts(always_fails, choosers, alts, trace_label="t", state=_on())

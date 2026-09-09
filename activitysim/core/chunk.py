@@ -173,6 +173,19 @@ def log_chunking_settings(state: workflow.State) -> None:
 MEMORY_RETRY_MAX_DEPTH = 3
 
 
+def _recovery_enabled(state) -> bool:
+    """Whether memory-fail recovery is switched on for this run.
+
+    With it off nothing here does anything at all: no cap is armed AND no MemoryError is
+    caught, so a run behaves exactly as it does without this feature. That is a deliberate
+    promise -- an opt-in feature should not change what happens to users who did not opt in,
+    even in a direction that looks like an improvement. Catching a MemoryError that would
+    otherwise have ended the run is still a behaviour change, and one nobody asked for.
+    """
+    settings = getattr(state, "settings", None) if state is not None else None
+    return bool(getattr(settings, "memory_fail_recovery", False))
+
+
 def _cap_for_chunk_work(state, trace_label):
     """Arm the per-worker cap around one attempt at a chunk, if recovery is enabled.
 
@@ -183,8 +196,7 @@ def _cap_for_chunk_work(state, trace_label):
     reached mandatory_tour_scheduling and then died on a 2.15 GB allocation in a chunk loop
     that had the cap but not the retry.
     """
-    settings = getattr(state, "settings", None) if state is not None else None
-    if not getattr(settings, "memory_fail_recovery", False):
+    if not _recovery_enabled(state):
         return contextlib.nullcontext()
     try:
         divisor = _worker_count(state)
@@ -255,6 +267,8 @@ def run_with_memory_retry(
     useful there without any cap. When the halving depth is exhausted the error re-raises —
     behavior then degrades to today's clean failure, never anything worse.
     """
+    if not _recovery_enabled(state):
+        return [work_fn(chooser_chunk)]     # feature off: upstream behaviour, exactly
     top_level = _workable is None
     if top_level:
         _workable = []
@@ -348,6 +362,8 @@ def run_with_memory_retry_by_group(
     Falls back to re-raising when the chunk holds a single group: there is nothing left to
     split, and processing half a household would be worse than failing.
     """
+    if not _recovery_enabled(state):
+        return [work_fn(chooser_chunk)]     # feature off: upstream behaviour, exactly
     top_level = _workable is None
     if top_level:
         _workable = []
@@ -478,6 +494,8 @@ def run_with_memory_retry_alts(
     ``state`` serves the same purpose as in ``run_with_memory_retry``: it lets a failed
     attempt's random draws be rewound so the retry reproduces an unfailed run.
     """
+    if not _recovery_enabled(state):
+        return [work_fn(chooser_chunk, alt_chunk)]   # feature off: upstream behaviour
     top_level = _workable is None
     if top_level:
         _workable = []
